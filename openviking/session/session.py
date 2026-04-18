@@ -1511,14 +1511,59 @@ class Session:
             return await self._fallback_generate_wm_creation(formatted, messages)
 
         try:
-            args = resp.tool_calls[0].arguments
+            raw_args = resp.tool_calls[0].arguments
+            _wm_debug(
+                f"raw_args type={type(raw_args).__name__} "
+                f"preview={str(raw_args)[:400]!r}"
+            )
+            args = raw_args
             if isinstance(args, str):
                 args = json.loads(args)
             if not isinstance(args, dict):
                 raise ValueError(f"tool_call arguments is not a dict: {type(args).__name__}")
-            ops = args.get("sections")
+
+            # OV's VLM backend wraps unparseable JSON strings as {"raw": "..."}.
+            # Try a best-effort recovery: json.loads the raw string; if that
+            # still fails, attempt a tolerant parse (add a closing brace if the
+            # string looks truncated, extract up to the last valid JSON object).
+            if list(args.keys()) == ["raw"] and isinstance(args["raw"], str):
+                raw_str = args["raw"]
+                _wm_debug(f"args has only 'raw' key; attempting recovery len={len(raw_str)}")
+                recovered = None
+                try:
+                    recovered = json.loads(raw_str)
+                except Exception:
+                    # Try to close a truncated JSON by appending closing braces
+                    # for every unmatched opener.
+                    try:
+                        opens = raw_str.count("{") - raw_str.count("}")
+                        if opens > 0:
+                            patched = raw_str.rstrip().rstrip(",") + ("}" * opens)
+                            recovered = json.loads(patched)
+                            _wm_debug(
+                                f"recovered by closing {opens} brace(s); "
+                                f"patched_len={len(patched)}"
+                            )
+                    except Exception as e2:
+                        _wm_debug(f"brace-close recovery failed: {e2}")
+                if isinstance(recovered, dict):
+                    args = recovered
+                    _wm_debug(f"recovered args keys={list(args.keys())}")
+
+            _wm_debug(f"args keys={list(args.keys())}")
+            # Tolerant: if LLM returned {"Session Title": {...}, ...} without
+            # the outer "sections" wrapper, treat the top-level as ops.
+            if "sections" in args and isinstance(args["sections"], dict):
+                ops = args["sections"]
+            elif all(k in args for k in WM_SEVEN_SECTIONS):
+                _wm_debug("args has section keys directly; accepting as ops")
+                ops = args
+            else:
+                raise ValueError(
+                    f"tool_call arguments.sections missing; keys={list(args.keys())}"
+                )
             if not isinstance(ops, dict):
-                raise ValueError("tool_call arguments.sections missing or not a dict")
+                raise ValueError("ops is not a dict")
         except Exception as e:
             _wm_debug(f"args parse failed: {type(e).__name__}: {e}")
             logger.warning(
