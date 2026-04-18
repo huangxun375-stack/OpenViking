@@ -32,6 +32,20 @@ logger = get_logger(__name__)
 _ARCHIVE_WAIT_POLL_SECONDS = 0.1
 
 
+def _wm_debug(msg: str) -> None:
+    """Write a WM debug line to a dedicated file so it survives uvicorn's
+    background-task stdout capture. Best-effort, never raises."""
+    try:
+        from pathlib import Path as _P
+        _log_path = _P(r"E:\\work_memory\\openviking-runtime\\log\\wm_debug.log")
+        _log_path.parent.mkdir(parents=True, exist_ok=True)
+        with _log_path.open("a", encoding="utf-8") as f:
+            import time as _t
+            f.write(f"{_t.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
 # =====================================================================
 # Working Memory v2
 # ---------------------------------------------------------------------
@@ -1414,6 +1428,8 @@ class Session:
           tool_call / JSON / schema anomaly, fall back to the creation
           prompt so we never persist malformed output as WM.
         """
+        _wm_debug(f"_generate_archive_summary_async called "
+                  f"messages={len(messages)} prior_wm={len(latest_archive_overview)}B")
         if not messages:
             return ""
 
@@ -1439,6 +1455,7 @@ class Session:
 
         # -------- Branch 1: no prior WM -> full creation --------
         if not latest_archive_overview:
+            _wm_debug("branch=CREATE (no prior WM)")
             try:
                 prompt = render_prompt(
                     "compression.ov_wm_v2",
@@ -1446,6 +1463,7 @@ class Session:
                 )
                 return await vlm.get_completion_async(prompt)
             except Exception as e:
+                _wm_debug(f"creation failed: {e}")
                 logger.warning(f"WM creation failed: {e}")
                 turn_count = len([m for m in messages if m.role == "user"])
                 return (
@@ -1454,6 +1472,7 @@ class Session:
                 )
 
         # -------- Branch 2: has prior WM -> tool_call incremental update --------
+        _wm_debug(f"branch=UPDATE (prior WM={len(latest_archive_overview)}B)")
         try:
             update_prompt = render_prompt(
                 "compression.ov_wm_v2_update",
@@ -1471,12 +1490,21 @@ class Session:
                 },
             )
         except Exception as e:
+            import traceback as _tb
+            _wm_debug(
+                f"tool_call raised: {type(e).__name__}: {e} "
+                f"tb={_tb.format_exc()[-400:]}"
+            )
             logger.warning(
                 "WM update tool_call failed (%s); falling back to creation prompt", e
             )
             return await self._fallback_generate_wm_creation(formatted, messages)
 
-        if not getattr(resp, "has_tool_calls", False) or not getattr(resp, "tool_calls", None):
+        has_tc = bool(getattr(resp, "has_tool_calls", False) and getattr(resp, "tool_calls", None))
+        _preview = (str(resp)[:200]).replace(chr(10), " ")
+        _wm_debug(f"resp type={type(resp).__name__} has_tool_calls={has_tc} preview={_preview!r}")
+
+        if not has_tc:
             logger.warning(
                 "WM update: LLM returned no tool_call; falling back to creation prompt"
             )
@@ -1492,11 +1520,16 @@ class Session:
             if not isinstance(ops, dict):
                 raise ValueError("tool_call arguments.sections missing or not a dict")
         except Exception as e:
+            _wm_debug(f"args parse failed: {type(e).__name__}: {e}")
             logger.warning(
                 "WM update: tool_call arguments parse failed (%s); falling back", e
             )
             return await self._fallback_generate_wm_creation(formatted, messages)
 
+        _wm_debug(
+            f"ops keys={list(ops.keys())[:7]} "
+            f"ops_summary={[(k, v.get('op') if isinstance(v, dict) else type(v).__name__) for k, v in ops.items()][:7]}"
+        )
         return self._merge_wm_sections(latest_archive_overview, ops)
 
     async def _fallback_generate_wm_creation(
@@ -1544,6 +1577,207 @@ class Session:
             sections[current] = "\n".join(buf).strip()
         return sections
 
+    # Sections where server enforces APPEND-only regardless of what the LLM emits.
+    # These represent monotonically-growing knowledge (decisions, errors) that
+    # must never shrink — empirically LLMs with long prompts cannot reliably
+    # carry forward prior content in an UPDATE, so we force APPEND semantics.
+    _WM_APPEND_ONLY_SECTIONS = frozenset({
+        "Errors & Corrections",
+        "Key Facts & Decisions",
+    })
+
+    # Very loose path-like token regex used to detect file paths that existed
+    # in prior Files & Context and MUST NOT silently disappear after UPDATE.
+    _WM_PATH_LIKE_RE = re.compile(
+        r"(?:[\w./\\-]+\.(?:py|ts|tsx|js|jsx|md|yaml|yml|json|sh|ps1|cmd|bat|toml|ini|cfg|rs|go))"
+        r"|(?:[a-zA-Z_][\w\-]*(?:/[a-zA-Z_][\w\-]*){1,})",
+        re.IGNORECASE,
+    )
+
+    _WM_TITLE_STOPWORDS = frozenset({
+        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for",
+        "with", "by", "at", "from", "session", "title", "working", "memory",
+        "plan", "plans", "notes", "note",
+    })
+
+    @staticmethod
+    def _wm_extract_bullet_items(text: str) -> List[str]:
+        """Extract bullet-like items from a markdown section body.
+
+        Recognizes ``- ...``, ``* ...``, ``1. ...``, ``2) ...`` lines, as well
+        as plain non-bullet lines (treated as single items).
+        """
+        items: List[str] = []
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            m = re.match(r"^(?:[-*]|\d+[\.)])\s+(.*)$", stripped)
+            if m:
+                item = m.group(1).strip()
+            else:
+                item = stripped
+            if item:
+                items.append(item)
+        return items
+
+    @staticmethod
+    def _wm_enforce_append_only(
+        header: str, op: Any, old_content: str
+    ) -> Dict[str, Any]:
+        """Guard: force KEEP/APPEND semantics on APPEND-only sections.
+
+        - KEEP and APPEND pass through.
+        - UPDATE is demoted: its content is parsed for bullet items; any items
+          that are not already present in the old body are re-emitted as APPEND
+          items, so nothing from the LLM's rewrite is lost but nothing from
+          the old body is dropped either.
+        - None/unknown op -> KEEP.
+        """
+        if not isinstance(op, dict):
+            return {"op": "KEEP"}
+        op_name = (op.get("op") or "").upper()
+        if op_name in ("KEEP", "APPEND"):
+            return op
+        if op_name != "UPDATE":
+            return {"op": "KEEP"}
+
+        new_content = (op.get("content") or "").strip()
+        new_items = Session._wm_extract_bullet_items(new_content)
+        # Use loose contains-check to dedup items already present in old body.
+        old_lower = (old_content or "").lower()
+        fresh_items = []
+        for it in new_items:
+            # Trim markdown emphasis so "_foo_" and "foo" dedup.
+            key = it.strip("_* `").lower()
+            if key and key not in old_lower:
+                fresh_items.append(it)
+        _wm_debug(
+            f"guard: section {header!r} UPDATE -> forced APPEND "
+            f"(llm_items={len(new_items)}, fresh_after_dedup={len(fresh_items)})"
+        )
+        if not fresh_items:
+            return {"op": "KEEP"}
+        return {"op": "APPEND", "items": fresh_items}
+
+    @staticmethod
+    def _wm_enforce_files_no_regression(op: Any, old_content: str) -> Dict[str, Any]:
+        """Guard: don't let a 'Files & Context' UPDATE drop file paths.
+
+        If the LLM returns UPDATE whose content is missing one or more file
+        paths that existed in the old content, reject the UPDATE. If the LLM
+        introduced any new paths, surface them as an APPEND; otherwise KEEP.
+        """
+        if not isinstance(op, dict):
+            return {"op": "KEEP"}
+        op_name = (op.get("op") or "").upper()
+        if op_name != "UPDATE":
+            return op
+
+        new_content = (op.get("content") or "").strip()
+        old_paths = set(Session._WM_PATH_LIKE_RE.findall(old_content or ""))
+        new_paths = set(Session._WM_PATH_LIKE_RE.findall(new_content))
+        missing = {p for p in old_paths if p not in new_paths}
+        if not missing:
+            return op
+
+        added_paths = new_paths - old_paths
+        _wm_debug(
+            f"guard: 'Files & Context' UPDATE drops {len(missing)} paths "
+            f"{sorted(list(missing))[:5]}; forcing KEEP (+ APPEND new paths="
+            f"{len(added_paths)})"
+        )
+        if added_paths:
+            # Preserve the old body as-is, then append the genuinely-new items
+            # the LLM added (with a short rationale line if we can find one).
+            new_items: List[str] = []
+            for path in sorted(added_paths):
+                # Try to pull the LLM's own phrasing for that path from new_content
+                for line in new_content.splitlines():
+                    if path in line:
+                        new_items.append(line.strip().lstrip("-*").strip())
+                        break
+                else:
+                    new_items.append(f"{path} (newly referenced)")
+            return {"op": "APPEND", "items": new_items}
+        return {"op": "KEEP"}
+
+    @staticmethod
+    def _wm_enforce_title_stability(op: Any, old_content: str) -> Dict[str, Any]:
+        """Guard: reject Session Title UPDATE when it drifts too far.
+
+        Heuristic: if the meaningful-word overlap between the old title and
+        the proposed new title is 0, treat it as drift and fall back to KEEP.
+        This catches the common failure where the LLM rewrites the title each
+        round based on the latest delta instead of the overall session scope.
+        """
+        if not isinstance(op, dict):
+            return {"op": "KEEP"}
+        op_name = (op.get("op") or "").upper()
+        if op_name != "UPDATE":
+            return op
+
+        new_content = (op.get("content") or "").strip()
+
+        def meaningful_words(text: str) -> set:
+            tokens = re.findall(r"[A-Za-z][A-Za-z0-9\.]{2,}|[\d\.]+", text or "")
+            return {
+                t.lower() for t in tokens
+                if t.lower() not in Session._WM_TITLE_STOPWORDS
+            }
+
+        old_w = meaningful_words(old_content)
+        new_w = meaningful_words(new_content)
+
+        # If the previous title was empty we have nothing to compare against.
+        if not old_w:
+            return op
+        # If overlap >= 1 meaningful word, accept the rewording.
+        if len(old_w & new_w) >= 1:
+            return op
+        _wm_debug(
+            f"guard: Session Title drift rejected "
+            f"(old={old_content[:80]!r}, new={new_content[:80]!r}); KEEP"
+        )
+        return {"op": "KEEP"}
+
+    @staticmethod
+    def _wm_enforce_open_issues_resolved(op: Any, old_content: str) -> Dict[str, Any]:
+        """Guard: don't let an Open Issues UPDATE silently drop items.
+
+        Any bullet from the old body whose first 40 lowercase chars do not
+        appear anywhere in the new content is considered silently dropped.
+        We append those items back with a ``[silently dropped, restored]``
+        marker so the caller can see the LLM's intent but no information is
+        lost.
+        """
+        if not isinstance(op, dict):
+            return op
+        op_name = (op.get("op") or "").upper()
+        if op_name != "UPDATE":
+            return op
+
+        new_content = (op.get("content") or "").strip()
+        new_lower = new_content.lower()
+        old_items = Session._wm_extract_bullet_items(old_content or "")
+        dropped: List[str] = []
+        for it in old_items:
+            snippet = it[:40].lower().strip("_* `").strip()
+            if snippet and snippet not in new_lower:
+                dropped.append(it)
+        if not dropped:
+            return op
+
+        _wm_debug(
+            f"guard: Open Issues UPDATE silently dropped {len(dropped)} "
+            f"items; restoring with [silently dropped, restored] marker"
+        )
+        restored = "\n".join(
+            f"- [silently dropped, restored] {it}" for it in dropped
+        )
+        merged = (new_content + ("\n" if new_content else "") + restored).strip()
+        return {"op": "UPDATE", "content": merged}
+
     @staticmethod
     def _merge_wm_sections(old_wm: str, ops: Dict[str, Any]) -> str:
         """Merge LLM per-section ops into a new Working Memory document.
@@ -1554,10 +1788,25 @@ class Session:
              "Current State":  {"op": "UPDATE", "content": "..."},
              "Open Issues":    {"op": "APPEND", "items": ["...", "..."]}}
 
+        Per-section server-side guards run BEFORE the op is applied:
+
+        - ``Errors & Corrections`` and ``Key Facts & Decisions`` are
+          append-only; UPDATE is demoted to APPEND of only-new items.
+        - ``Files & Context`` UPDATE that loses old file paths is rejected
+          (KEEP + APPEND newly-added paths instead).
+        - ``Session Title`` UPDATE with zero meaningful-word overlap against
+          the prior title is rejected (KEEP instead).
+        - ``Open Issues`` UPDATE that silently drops old items restores them
+          with an explicit marker.
+
         Missing sections or unknown ops default to ``KEEP`` (the schema
         should prevent this, but we stay defensive so a buggy LLM or
         schema-loose backend cannot wipe out the prior WM).
         """
+        _wm_debug(
+            f"_merge_wm_sections entry old_wm={len(old_wm or '')}B "
+            f"sections={list((ops or {}).keys())[:7]}"
+        )
         old_sections = Session._parse_wm_sections(old_wm)
 
         parts: List[str] = ["# Working Memory", ""]
@@ -1565,6 +1814,18 @@ class Session:
             full_header = f"## {header}"
             op = (ops or {}).get(header)
             old_content = old_sections.get(full_header, "").rstrip()
+
+            # ---------- per-section guards ----------
+            if old_content:
+                if header == "Session Title":
+                    op = Session._wm_enforce_title_stability(op, old_content)
+                elif header in Session._WM_APPEND_ONLY_SECTIONS:
+                    op = Session._wm_enforce_append_only(header, op, old_content)
+                elif header == "Files & Context":
+                    op = Session._wm_enforce_files_no_regression(op, old_content)
+                elif header == "Open Issues":
+                    op = Session._wm_enforce_open_issues_resolved(op, old_content)
+            # ----------------------------------------
 
             if op is None:
                 new_content = old_content
