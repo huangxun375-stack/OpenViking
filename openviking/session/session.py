@@ -92,6 +92,16 @@ class SessionMeta:
             "total_tokens": 0,
         }
     )
+    # Working-Memory v2: token accounting for sliding window + keep window.
+    # pending_tokens is the cumulative estimated_tokens of messages that fall
+    # OUTSIDE the recent-keep window and will be archived on the next commit.
+    # Maintained O(1) inside add_message(); rebuilt from messages on load.
+    pending_tokens: int = 0
+    # keep_recent_count is the last value passed from the plugin through
+    # POST /sessions/{id}/commit body. It is remembered so subsequent
+    # add_message calls can maintain pending_tokens consistently across
+    # process restarts.
+    keep_recent_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -107,6 +117,8 @@ class SessionMeta:
             "last_commit_at": self.last_commit_at,
             "llm_token_usage": dict(self.llm_token_usage),
             "embedding_token_usage": dict(self.embedding_token_usage),
+            "pending_tokens": self.pending_tokens,
+            "keep_recent_count": self.keep_recent_count,
         }
 
     @classmethod
@@ -144,6 +156,8 @@ class SessionMeta:
             embedding_token_usage={
                 "total_tokens": embedding_token_usage.get("total_tokens", 0),
             },
+            pending_tokens=int(data.get("pending_tokens", 0) or 0),
+            keep_recent_count=int(data.get("keep_recent_count", 0) or 0),
         )
 
 
@@ -247,7 +261,32 @@ class Session:
         for message in self._messages:
             self._record_participant(message)
 
+        # WM v2: always rebuild pending_tokens from current messages so the
+        # counter stays consistent across restarts and is also backfilled for
+        # legacy sessions whose .meta.json predates these fields. O(n) once,
+        # subsequent add_message() maintains it in O(1).
+        self._rebuild_pending_tokens()
+
         self._loaded = True
+
+    def _rebuild_pending_tokens(self) -> None:
+        """Recompute ``pending_tokens`` from the current message list.
+
+        Used on load and as a safety net after rollbacks. Respects the
+        currently remembered ``keep_recent_count`` from meta.
+        """
+        keep = int(self._meta.keep_recent_count or 0)
+        total = len(self._messages)
+        if keep <= 0:
+            self._meta.pending_tokens = sum(
+                int(m.estimated_tokens or 0) for m in self._messages
+            )
+        elif total > keep:
+            self._meta.pending_tokens = sum(
+                int(m.estimated_tokens or 0) for m in self._messages[: total - keep]
+            )
+        else:
+            self._meta.pending_tokens = 0
 
     async def exists(self) -> bool:
         """Check whether this session already exists in storage."""
@@ -354,7 +393,20 @@ class Session:
         # Update statistics
         if role == "user":
             self._stats.total_turns += 1
-        self._stats.total_tokens += msg.estimated_tokens
+        msg_tokens = int(msg.estimated_tokens or 0)
+        self._stats.total_tokens += msg_tokens
+
+        # WM v2: maintain pending_tokens via sliding window.
+        # keep_recent_count == 0 (never-committed or compact path that chose 0):
+        #   every new message contributes to pending.
+        # keep_recent_count > 0:
+        #   only the message pushed OUT of the tail-keep window contributes.
+        keep = int(self._meta.keep_recent_count or 0)
+        if keep <= 0:
+            self._meta.pending_tokens += msg_tokens
+        elif len(self._messages) > keep:
+            pushed_out = self._messages[-(keep + 1)]
+            self._meta.pending_tokens += int(pushed_out.estimated_tokens or 0)
 
         self._append_to_jsonl(msg)
 
@@ -392,18 +444,27 @@ class Session:
         self._save_tool_result(tool_id, msg, output, status)
         self._update_message_in_jsonl()
 
-    def commit(self) -> Dict[str, Any]:
+    def commit(self, keep_recent_count: int = 0) -> Dict[str, Any]:
         """Sync wrapper for commit_async()."""
-        return run_async(self.commit_async())
+        return run_async(self.commit_async(keep_recent_count=keep_recent_count))
 
     @tracer("session.commit")
-    async def commit_async(self) -> Dict[str, Any]:
+    async def commit_async(self, keep_recent_count: int = 0) -> Dict[str, Any]:
         """Async commit session: archive immediately, extract memories in background.
 
-        Phase 1 (Archive prep, PathLock-protected): Copy messages, clear live
-        session, increment compression index. Uses a distributed filesystem lock
-        (PathLock) so this works across workers and processes.
-        Phase 2 (Memory extraction): Always runs in background via asyncio.create_task().
+        Phase 1 (Archive prep, PathLock-protected): Split messages into
+        archive/retain parts, write the retained tail back to messages.jsonl,
+        then persist the archive. Uses a distributed filesystem lock (PathLock)
+        so this works across workers and processes.
+        Phase 2 (Memory extraction): Always runs in background via
+        asyncio.create_task().
+
+        Args:
+            keep_recent_count: Number of most-recent messages to keep in the
+                live session after commit. ``0`` (default) preserves the old
+                behavior of archiving everything. The plugin's afterTurn path
+                typically passes its configured value (default 10); the compact
+                path passes ``0``.
 
         Returns a task_id for tracking Phase 2 progress.
         """
@@ -412,12 +473,19 @@ class Session:
         from openviking_cli.exceptions import FailedPreconditionError
 
         trace_id = tracer.get_trace_id()
-        logger.info(f"[TRACER] session_commit started, trace_id={trace_id}")
+        keep_recent_count = max(0, int(keep_recent_count or 0))
+        logger.info(
+            f"[TRACER] session_commit started, trace_id={trace_id}, "
+            f"keep_recent_count={keep_recent_count}"
+        )
 
         # ===== Phase 1: Snapshot + clear (PathLock-protected) =====
         # Fast pre-check: skip lock entirely if no messages (common case avoids
         # unnecessary filesystem lock acquisition).
         if not self._messages:
+            self._meta.pending_tokens = 0
+            self._meta.keep_recent_count = keep_recent_count
+            await self._save_meta()
             get_current_telemetry().set("memory.extracted", 0)
             return {
                 "session_id": self.session_id,
@@ -442,6 +510,9 @@ class Session:
             # Authoritative check under lock: handles the race where two concurrent
             # callers both passed the pre-check but only the first should archive.
             if not self._messages:
+                self._meta.pending_tokens = 0
+                self._meta.keep_recent_count = keep_recent_count
+                await self._save_meta()
                 get_current_telemetry().set("memory.extracted", 0)
                 return {
                     "session_id": self.session_id,
@@ -452,20 +523,48 @@ class Session:
                     "trace_id": trace_id,
                 }
 
+            # WM v2 boundary: if all live messages already fit inside the keep
+            # window, there is nothing to archive — just remember the new
+            # keep_recent_count and reset pending_tokens so the next
+            # add_message uses the sliding-window path.
+            total = len(self._messages)
+            if keep_recent_count > 0 and total <= keep_recent_count:
+                self._meta.pending_tokens = 0
+                self._meta.keep_recent_count = keep_recent_count
+                self._meta.message_count = total
+                await self._save_meta()
+                get_current_telemetry().set("memory.extracted", 0)
+                return {
+                    "session_id": self.session_id,
+                    "status": "accepted",
+                    "task_id": None,
+                    "archive_uri": None,
+                    "archived": False,
+                    "reason": "all_within_keep_window",
+                    "trace_id": trace_id,
+                }
+
             self._compression.compression_index += 1
-            messages_to_archive = self._messages.copy()
-            self._messages.clear()
+            if keep_recent_count > 0:
+                split_idx = total - keep_recent_count
+                messages_to_archive = self._messages[:split_idx]
+                self._messages = self._messages[split_idx:]
+            else:
+                messages_to_archive = self._messages.copy()
+                self._messages = []
 
             try:
-                await self._write_to_agfs_async(messages=[])
+                # Persist the retained tail (may be empty when keep=0). This
+                # replaces messages.jsonl under the lock, consistent with the
+                # previous behavior of writing empty messages on full clear.
+                await self._write_to_agfs_async(messages=self._messages)
             except Exception as e:
                 # Rollback: restore messages so they aren't lost
-                logger.error(f"[commit] Failed to write empty messages.jsonl: {e}")
-                self._messages.extend(messages_to_archive)
+                logger.error(f"[commit] Failed to write messages.jsonl: {e}")
+                self._messages = list(messages_to_archive) + list(self._messages)
                 self._compression.compression_index -= 1
                 raise
-        # Lock released — live session is now clean.
-        # Any add_message() from here appends to the fresh empty list.
+        # Lock released — live session now contains only the retained tail.
 
         # ===== Phase 1 continued: Write raw archive (no LLM calls, no lock needed) =====
         archive_uri = (
@@ -479,7 +578,11 @@ class Session:
                 ctx=self.ctx,
             )
 
-        self._meta.message_count = 0
+        # WM v2: live session is now the retained tail; pending_tokens resets
+        # because anything that was pending has been archived.
+        self._meta.message_count = len(self._messages)
+        self._meta.pending_tokens = 0
+        self._meta.keep_recent_count = keep_recent_count
         await self._save_meta()
 
         self._compression.original_count += len(messages_to_archive)
