@@ -1570,9 +1570,48 @@ class Session:
             if not isinstance(ops, dict):
                 raise ValueError("ops is not a dict")
         except Exception as e:
-            _wm_debug(f"args parse failed: {type(e).__name__}: {e}")
+            _wm_debug(
+                f"args parse failed: {type(e).__name__}: {e}; "
+                f"attempting regex recovery from raw"
+            )
+            # Regex salvage: when the LLM emits slightly-broken JSON (curly
+            # quote, unescaped newline, truncated string), OV's VLM backend
+            # wraps it as {"raw": "..."} and all structural parsing fails. We
+            # still try to pull each section's op directly via regex before
+            # falling back to the creation prompt. Missing sections default
+            # to KEEP in _merge_wm_sections so old content is preserved.
+            raw_for_recovery = ""
+            if isinstance(raw_args, str):
+                raw_for_recovery = raw_args
+            elif isinstance(raw_args, dict):
+                if isinstance(raw_args.get("raw"), str):
+                    raw_for_recovery = raw_args["raw"]
+                else:
+                    try:
+                        raw_for_recovery = json.dumps(raw_args, ensure_ascii=False)
+                    except Exception:
+                        raw_for_recovery = str(raw_args)
+            salvaged = Session._wm_recover_ops_from_raw(raw_for_recovery)
+            if salvaged:
+                _wm_debug(
+                    f"regex recovery salvaged {len(salvaged)}/"
+                    f"{len(WM_SEVEN_SECTIONS)} sections: "
+                    f"{[(k, v.get('op')) for k, v in salvaged.items()]}"
+                )
+                logger.info(
+                    "WM update: regex recovery salvaged %d/%d sections; "
+                    "proceeding with partial ops",
+                    len(salvaged),
+                    len(WM_SEVEN_SECTIONS),
+                )
+                return self._merge_wm_sections(latest_archive_overview, salvaged)
+            _wm_debug(
+                "regex recovery salvaged 0 sections; falling back to creation prompt"
+            )
             logger.warning(
-                "WM update: tool_call arguments parse failed (%s); falling back", e
+                "WM update: tool_call arguments parse failed (%s); "
+                "regex recovery found nothing; falling back to creation prompt",
+                e,
             )
             return await self._fallback_generate_wm_creation(formatted, messages)
 
@@ -1649,6 +1688,80 @@ class Session:
         "with", "by", "at", "from", "session", "title", "working", "memory",
         "plan", "plans", "notes", "note",
     })
+
+    @staticmethod
+    def _wm_recover_ops_from_raw(raw_str: str) -> Dict[str, Any]:
+        """Best-effort regex recovery of per-section ops from a malformed
+        tool_call arguments string.
+
+        Used when OV's VLM backend wraps non-JSON tool-call args as
+        ``{"raw": "..."}`` (typical when the LLM emits unescaped characters
+        inside a string value, uses curly quotes, or emits a truncated JSON).
+        Scans the raw text for each of the 7 fixed section names and their
+        ``{"op": "KEEP|UPDATE|APPEND", ...}`` markers. Partial UPDATE
+        content / APPEND items are tolerated; sections that cannot be found
+        at all are simply omitted (the merge step will then default them to
+        KEEP and preserve the prior content).
+
+        Returns a partial ops dict (possibly fewer than 7 sections).
+        """
+        if not raw_str:
+            return {}
+
+        ops: Dict[str, Any] = {}
+        names_alt = "|".join(re.escape(n) for n in WM_SEVEN_SECTIONS)
+
+        # --- KEEP: "Name": {"op": "KEEP"} ---
+        keep_re = re.compile(
+            rf'"({names_alt})"\s*:\s*\{{\s*"op"\s*:\s*"KEEP"\s*\}}'
+        )
+        for m in keep_re.finditer(raw_str):
+            ops.setdefault(m.group(1), {"op": "KEEP"})
+
+        # --- UPDATE: "Name": {"op": "UPDATE", "content": "..."} ---
+        # Capture content non-greedily up to either:
+        #   (a) a closing '"}' that ends the section, or
+        #   (b) the start of the next section key (meaning content string was truncated).
+        # DOTALL so newlines inside content don't end the match.
+        update_re = re.compile(
+            rf'"({names_alt})"\s*:\s*\{{\s*"op"\s*:\s*"UPDATE"\s*,\s*"content"\s*:\s*"'
+            rf'((?:[^"\\]|\\.)*?)'
+            rf'(?:"\s*\}}|(?="\s*,\s*"(?:' + names_alt + r')"))',
+            re.DOTALL,
+        )
+        for m in update_re.finditer(raw_str):
+            header = m.group(1)
+            if header in ops:
+                continue
+            captured = m.group(2)
+            try:
+                content = json.loads('"' + captured + '"')
+            except Exception:
+                content = captured
+            ops[header] = {"op": "UPDATE", "content": content}
+
+        # --- APPEND: "Name": {"op": "APPEND", "items": [...]} ---
+        # Tolerate truncated array (no closing ']').
+        append_re = re.compile(
+            rf'"({names_alt})"\s*:\s*\{{\s*"op"\s*:\s*"APPEND"\s*,\s*"items"\s*:\s*\['
+            rf'([\s\S]*?)(?:\]|$)',
+        )
+        item_re = re.compile(r'"((?:[^"\\]|\\.)*)"', re.DOTALL)
+        for m in append_re.finditer(raw_str):
+            header = m.group(1)
+            if header in ops:
+                continue
+            items_raw = m.group(2)
+            items: List[str] = []
+            for im in item_re.finditer(items_raw):
+                captured = im.group(1)
+                try:
+                    items.append(json.loads('"' + captured + '"'))
+                except Exception:
+                    items.append(captured)
+            ops[header] = {"op": "APPEND", "items": items}
+
+        return ops
 
     @staticmethod
     def _wm_extract_bullet_items(text: str) -> List[str]:
