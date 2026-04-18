@@ -32,6 +32,98 @@ logger = get_logger(__name__)
 _ARCHIVE_WAIT_POLL_SECONDS = 0.1
 
 
+# =====================================================================
+# Working Memory v2
+# ---------------------------------------------------------------------
+# Phase 2 of a commit generates / updates a structured 7-section Working
+# Memory document stored at archive_NNN/.overview.md.
+#
+# First commit: call `compression.ov_wm_v2` with a plain completion.
+# Subsequent commits: call `compression.ov_wm_v2_update` with the
+# `update_working_memory` tool to get a per-section decision, then let
+# the server do section-level merge against the previous WM.
+# =====================================================================
+
+WM_SEVEN_SECTIONS: List[str] = [
+    "Session Title",
+    "Current State",
+    "Task & Goals",
+    "Key Facts & Decisions",
+    "Files & Context",
+    "Errors & Corrections",
+    "Open Issues",
+]
+
+_WM_SECTION_OP_SCHEMA: Dict[str, Any] = {
+    "oneOf": [
+        {
+            "type": "object",
+            "required": ["op"],
+            "additionalProperties": False,
+            "properties": {"op": {"type": "string", "enum": ["KEEP"]}},
+        },
+        {
+            "type": "object",
+            "required": ["op", "content"],
+            "additionalProperties": False,
+            "properties": {
+                "op": {"type": "string", "enum": ["UPDATE"]},
+                "content": {
+                    "type": "string",
+                    "description": (
+                        "FULL replacement content for this section, markdown, "
+                        "WITHOUT the '## <section>' header line."
+                    ),
+                },
+            },
+        },
+        {
+            "type": "object",
+            "required": ["op", "items"],
+            "additionalProperties": False,
+            "properties": {
+                "op": {"type": "string", "enum": ["APPEND"]},
+                "items": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "New bullet-style items to append under the existing "
+                        "section body. Omit heading / bullet markers; the "
+                        "server renders each item as '- <item>'."
+                    ),
+                },
+            },
+        },
+    ]
+}
+
+WM_UPDATE_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "update_working_memory",
+        "description": (
+            "Emit a per-section decision (KEEP / UPDATE / APPEND) for the "
+            "7-section Working Memory document."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["sections"],
+            "additionalProperties": False,
+            "properties": {
+                "sections": {
+                    "type": "object",
+                    "required": list(WM_SEVEN_SECTIONS),
+                    "additionalProperties": False,
+                    "properties": {
+                        name: _WM_SECTION_OP_SCHEMA for name in WM_SEVEN_SECTIONS
+                    },
+                }
+            },
+        },
+    },
+}
+
+
 @dataclass
 class SessionCompression:
     """Session compression information."""
@@ -1310,30 +1402,201 @@ class Session:
         messages: List[Message],
         latest_archive_overview: str = "",
     ) -> str:
-        """Generate structured summary for archive (async)."""
+        """Generate Working Memory document for the current archive (async).
+
+        Two paths:
+
+        * No prior WM -> call ``compression.ov_wm_v2`` with a plain completion
+          and return the full 7-section markdown.
+        * Has prior WM -> call ``compression.ov_wm_v2_update`` with the
+          ``update_working_memory`` tool forced on; parse per-section
+          decisions and merge them against the previous WM. On any
+          tool_call / JSON / schema anomaly, fall back to the creation
+          prompt so we never persist malformed output as WM.
+        """
         if not messages:
             return ""
 
         formatted = "\n".join([f"[{m.role}]: {m.content}" for m in messages])
 
         vlm = get_openviking_config().vlm
-        if vlm and vlm.is_available():
-            try:
-                from openviking.prompts import render_prompt
+        if not (vlm and vlm.is_available()):
+            turn_count = len([m for m in messages if m.role == "user"])
+            return (
+                f"# Session Summary\n\n"
+                f"**Overview**: {turn_count} turns, {len(messages)} messages"
+            )
 
+        try:
+            from openviking.prompts import render_prompt
+        except Exception as e:
+            logger.warning(f"Prompt module unavailable: {e}")
+            turn_count = len([m for m in messages if m.role == "user"])
+            return (
+                f"# Session Summary\n\n"
+                f"**Overview**: {turn_count} turns, {len(messages)} messages"
+            )
+
+        # -------- Branch 1: no prior WM -> full creation --------
+        if not latest_archive_overview:
+            try:
                 prompt = render_prompt(
-                    "compression.structured_summary",
-                    {
-                        "messages": formatted,
-                        "latest_archive_overview": latest_archive_overview,
-                    },
+                    "compression.ov_wm_v2",
+                    {"messages": formatted, "latest_archive_overview": ""},
                 )
                 return await vlm.get_completion_async(prompt)
             except Exception as e:
-                logger.warning(f"LLM summary failed: {e}")
+                logger.warning(f"WM creation failed: {e}")
+                turn_count = len([m for m in messages if m.role == "user"])
+                return (
+                    f"# Session Summary\n\n"
+                    f"**Overview**: {turn_count} turns, {len(messages)} messages"
+                )
 
-        turn_count = len([m for m in messages if m.role == "user"])
-        return f"# Session Summary\n\n**Overview**: {turn_count} turns, {len(messages)} messages"
+        # -------- Branch 2: has prior WM -> tool_call incremental update --------
+        try:
+            update_prompt = render_prompt(
+                "compression.ov_wm_v2_update",
+                {
+                    "messages": formatted,
+                    "latest_archive_overview": latest_archive_overview,
+                },
+            )
+            resp = await vlm.get_completion_async(
+                prompt=update_prompt,
+                tools=[WM_UPDATE_TOOL],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "update_working_memory"},
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                "WM update tool_call failed (%s); falling back to creation prompt", e
+            )
+            return await self._fallback_generate_wm_creation(formatted, messages)
+
+        if not getattr(resp, "has_tool_calls", False) or not getattr(resp, "tool_calls", None):
+            logger.warning(
+                "WM update: LLM returned no tool_call; falling back to creation prompt"
+            )
+            return await self._fallback_generate_wm_creation(formatted, messages)
+
+        try:
+            args = resp.tool_calls[0].arguments
+            if isinstance(args, str):
+                args = json.loads(args)
+            if not isinstance(args, dict):
+                raise ValueError(f"tool_call arguments is not a dict: {type(args).__name__}")
+            ops = args.get("sections")
+            if not isinstance(ops, dict):
+                raise ValueError("tool_call arguments.sections missing or not a dict")
+        except Exception as e:
+            logger.warning(
+                "WM update: tool_call arguments parse failed (%s); falling back", e
+            )
+            return await self._fallback_generate_wm_creation(formatted, messages)
+
+        return self._merge_wm_sections(latest_archive_overview, ops)
+
+    async def _fallback_generate_wm_creation(
+        self,
+        formatted_messages: str,
+        messages: List[Message],
+    ) -> str:
+        """Re-run WM creation prompt when the update tool_call path fails."""
+        try:
+            from openviking.prompts import render_prompt
+
+            prompt = render_prompt(
+                "compression.ov_wm_v2",
+                {"messages": formatted_messages, "latest_archive_overview": ""},
+            )
+            return await get_openviking_config().vlm.get_completion_async(prompt)
+        except Exception as e:
+            logger.warning(f"WM creation fallback failed: {e}")
+            turn_count = len([m for m in messages if m.role == "user"])
+            return (
+                f"# Session Summary\n\n"
+                f"**Overview**: {turn_count} turns, {len(messages)} messages"
+            )
+
+    @staticmethod
+    def _parse_wm_sections(text: str) -> Dict[str, str]:
+        """Parse an existing WM markdown into {header_line: body_text}.
+
+        Header comparison is case-sensitive on purpose: the update path only
+        uses this output to look up bodies by our own canonical headers.
+        """
+        sections: Dict[str, str] = {}
+        current: Optional[str] = None
+        buf: List[str] = []
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                if current is not None:
+                    sections[current] = "\n".join(buf).strip()
+                current = stripped
+                buf = []
+            elif current is not None:
+                buf.append(line)
+        if current is not None:
+            sections[current] = "\n".join(buf).strip()
+        return sections
+
+    @staticmethod
+    def _merge_wm_sections(old_wm: str, ops: Dict[str, Any]) -> str:
+        """Merge LLM per-section ops into a new Working Memory document.
+
+        ``ops`` is the schema-validated dict shaped like::
+
+            {"Session Title":  {"op": "KEEP"},
+             "Current State":  {"op": "UPDATE", "content": "..."},
+             "Open Issues":    {"op": "APPEND", "items": ["...", "..."]}}
+
+        Missing sections or unknown ops default to ``KEEP`` (the schema
+        should prevent this, but we stay defensive so a buggy LLM or
+        schema-loose backend cannot wipe out the prior WM).
+        """
+        old_sections = Session._parse_wm_sections(old_wm)
+
+        parts: List[str] = ["# Working Memory", ""]
+        for header in WM_SEVEN_SECTIONS:
+            full_header = f"## {header}"
+            op = (ops or {}).get(header)
+            old_content = old_sections.get(full_header, "").rstrip()
+
+            if op is None:
+                new_content = old_content
+            else:
+                op_name = (op.get("op") or "").upper() if isinstance(op, dict) else ""
+                if op_name == "KEEP":
+                    new_content = old_content
+                elif op_name == "UPDATE":
+                    new_content = (op.get("content") or "").strip()
+                elif op_name == "APPEND":
+                    items = op.get("items") or []
+                    appended = "\n".join(
+                        f"- {s.strip()}" for s in items if isinstance(s, str) and s.strip()
+                    )
+                    if old_content and appended:
+                        new_content = f"{old_content}\n{appended}"
+                    else:
+                        new_content = old_content or appended
+                else:
+                    logger.warning(
+                        "WM update: unknown op %r for section %r; keeping old content",
+                        op,
+                        header,
+                    )
+                    new_content = old_content
+
+            parts.append(full_header)
+            if new_content:
+                parts.append(new_content)
+            parts.append("")
+
+        return "\n".join(parts).rstrip() + "\n"
 
     def _write_archive(
         self,

@@ -1,0 +1,63 @@
+metadata:
+  id: "compression.ov_wm_v2_update"
+  name: "Working Memory v2 - Incremental Update (tool_call)"
+  description: "Incrementally update an existing Working Memory by emitting per-section decisions via the `update_working_memory` tool."
+  version: "2.1.0"
+  language: "en"
+  category: "compression"
+
+variables:
+  - name: "latest_archive_overview"
+    type: "string"
+    description: "Current (prior) Working Memory to be updated."
+    required: true
+  - name: "messages"
+    type: "string"
+    description: "New conversation content since the last update."
+    required: true
+
+template: |
+  You are the Working Memory maintainer. You will UPDATE an existing Working Memory
+  document by emitting a per-section decision via the `update_working_memory` tool.
+
+  Current Working Memory (7 sections, in fixed order):
+  <current_wm>
+  {{ latest_archive_overview }}
+  </current_wm>
+
+  New conversation content since the last update:
+  <new_content>
+  {{ messages }}
+  </new_content>
+
+  Decision semantics for each section:
+  - KEEP   — The existing section is still accurate. Server preserves it byte-for-byte.
+             Emit {"op": "KEEP"}.
+  - UPDATE — Rewrite the section. Emit {"op": "UPDATE", "content": "<full new body, markdown, no header line>"}.
+  - APPEND — Add one or more bullet items. Emit {"op": "APPEND", "items": ["item 1", "item 2", ...]}.
+             Server will render each item as "- <item>" under the existing body.
+
+  Per-section guidance:
+  - "Session Title"         : KEEP unless the session scope fundamentally changed.
+  - "Current State"         : Almost always UPDATE to reflect the latest status.
+  - "Task & Goals"          : KEEP unless the user added new goals.
+  - "Key Facts & Decisions" : APPEND for new decisions; UPDATE if an earlier decision was reversed.
+  - "Files & Context"       : UPDATE or APPEND when new files/paths/modules become relevant.
+  - "Errors & Corrections"  : APPEND when new errors/fixes occur.
+  - "Open Issues"           : UPDATE to reflect resolved + new issues; do not accumulate stale entries.
+
+  Global rules:
+  - Emit a decision for ALL 7 sections — the tool schema enforces this.
+  - Use KEEP aggressively — only change sections that genuinely need it.
+  - For temporal facts, always record the EVENT date, not the conversation date.
+    Example: conversation on May 8 mentioning "I went yesterday" -> use "7 May".
+  - Keep each section under ~500 tokens; the entire WM under ~1200 words.
+  - When UPDATE, emit full section body (not a diff / not tracked changes).
+  - When APPEND and the section is approaching length budget, prefer UPDATE to consolidate.
+  - Do not fabricate information.
+
+  You MUST call the `update_working_memory` tool exactly once. Do not output any
+  freeform text outside the tool call.
+
+llm_config:
+  temperature: 0.0
