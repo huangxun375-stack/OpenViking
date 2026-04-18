@@ -1107,7 +1107,11 @@ const mergeFindResults = (results: FindResult[]): FindResult => {
               [{ type: "text" as const, text }],
               storeAgentId,
             );
-            const commitResult = await c.commitSession(sessionId, { wait: true, agentId: storeAgentId });
+            const commitResult = await c.commitSession(sessionId, {
+              wait: true,
+              agentId: storeAgentId,
+              keepRecentCount: 0,
+            });
             const memoriesCount = totalCommitMemories(commitResult);
             if (commitResult.status === "failed") {
               api.logger.warn(

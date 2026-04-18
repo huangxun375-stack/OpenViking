@@ -630,7 +630,13 @@ export function createMemoryOpenVikingContextEngine(params: {
         ovSessionId: ovId,
       });
       const agentId = resolveAgentId(sessionId, sessionKey, ovId);
-      const commitResult = await client.commitSession(ovId, { wait: true, agentId });
+      // WM v2: manual / tool-triggered commit archives everything (keep=0)
+      // just like the legacy behavior.
+      const commitResult = await client.commitSession(ovId, {
+        wait: true,
+        agentId,
+        keepRecentCount: 0,
+      });
       const memCount = totalExtractedMemories(commitResult.memories_extracted);
       if (commitResult.status === "failed") {
         logger.warn?.(`openviking: commit Phase 2 failed for session=${sessionId}: ${commitResult.error ?? "unknown"}`);
@@ -1025,7 +1031,14 @@ export function createMemoryOpenVikingContextEngine(params: {
           return;
         }
 
-        const commitResult = await client.commitSession(OVSessionId, { wait: false, agentId });
+        // WM v2: afterTurn keeps a tail of recent messages live so the next
+        // turn still sees immediate context. Count comes from plugin config
+        // (default 10).
+        const commitResult = await client.commitSession(OVSessionId, {
+          wait: false,
+          agentId,
+          keepRecentCount: cfg.commitKeepRecentCount,
+        });
         logger.info(
           `openviking: committed session=${OVSessionId}, ` +
             `status=${commitResult.status}, archived=${commitResult.archived ?? false}, ` +
@@ -1116,7 +1129,14 @@ export function createMemoryOpenVikingContextEngine(params: {
         logger.info(
           `openviking: compact committing session=${OVSessionId} (wait=true, tokenBudget=${tokenBudget})`,
         );
-        const commitResult = await client.commitSession(OVSessionId, { wait: true, agentId });
+        // WM v2: compact path deliberately passes keepRecentCount=0 so every
+        // message gets archived into the new Working Memory, maximizing the
+        // reclaimed token budget (the compact caller is in a token crunch).
+        const commitResult = await client.commitSession(OVSessionId, {
+          wait: true,
+          agentId,
+          keepRecentCount: 0,
+        });
         const memCount = totalExtractedMemories(commitResult.memories_extracted);
 
         if (commitResult.status === "failed") {
