@@ -1502,7 +1502,12 @@ class Session:
 
         has_tc = bool(getattr(resp, "has_tool_calls", False) and getattr(resp, "tool_calls", None))
         _preview = (str(resp)[:200]).replace(chr(10), " ")
-        _wm_debug(f"resp type={type(resp).__name__} has_tool_calls={has_tc} preview={_preview!r}")
+        _finish = getattr(resp, "finish_reason", "n/a")
+        _usage = getattr(resp, "usage", {}) or {}
+        _wm_debug(
+            f"resp type={type(resp).__name__} has_tool_calls={has_tc} "
+            f"finish_reason={_finish!r} usage={_usage} preview={_preview!r}"
+        )
 
         if not has_tc:
             logger.warning(

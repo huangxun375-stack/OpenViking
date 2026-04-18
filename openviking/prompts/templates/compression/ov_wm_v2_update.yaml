@@ -130,9 +130,13 @@ template: |
   # RULE 4 — Output constraints.
 
   - The tool schema requires a decision for ALL 7 sections. Do not skip any.
-  - Each section body stays under ~500 tokens. If a section would exceed that
-     via APPEND, consolidate older bullets INSIDE an UPDATE (still carrying
-     every durable fact) and include the new items.
+  - Each section body stays under ~2000 tokens. The entire Working Memory
+     stays under ~12000 tokens. If a section would exceed ~2000 tokens via
+     APPEND, consolidate older bullets INSIDE an UPDATE (carrying EVERY
+     durable fact) and include the new items. If the entire WM would exceed
+     ~12000 tokens, compress Worklog-style older entries and merge redundant
+     bullets while preserving Current State, Errors & Corrections, and every
+     concrete file path / decision rationale.
   - Do not fabricate information not grounded in <new_content> or <current_wm>.
   - You MUST call `update_working_memory` exactly once. No freeform text
      outside the tool call.

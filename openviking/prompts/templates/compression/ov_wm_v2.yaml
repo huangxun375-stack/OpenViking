@@ -41,7 +41,10 @@ template: |
     Example: conversation on May 8 mentions "I went yesterday" -> record "7 May".
   - "Current State" is highest priority — always reflect the latest status.
   - If previous WM is provided: carry forward valid info, update changed items.
-  - Keep each section under ~500 tokens; overall under 1200 words.
+  - Keep each section under ~2000 tokens; the entire document under ~12000 tokens.
+    These budgets are intentionally generous — prefer preserving concrete facts
+    (file paths, errors, decisions, dates) over terseness. Only compress when a
+    section or the whole document is genuinely approaching the budget.
   - Do not fabricate information.
   - Focus on actionable, specific information that enables continuation.
 
