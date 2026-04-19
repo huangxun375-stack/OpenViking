@@ -437,10 +437,21 @@ function buildSystemPromptAddition(): string {
     "- The original conversations often use different words than the question",
     "  — try synonyms (e.g. question says \"adopt\" → also try \"adoption\",",
     "  \"single parent\", \"agency\"; question says \"feel\" → try the topic noun).",
+    "- For sentiment / status / relationship questions, also try the implied",
+    "  underlying nouns: \"relationship status\" → also try \"breakup\", \"single\",",
+    "  \"alone\", \"dating\"; \"how does X feel about Y\" → also try Y itself; ",
+    "  \"X realized\" → also try \"important\", \"matters\", the topic noun.",
     "- If the first search returns 0 matches, try a different keyword before",
     "  giving up. Only conclude the information isn't recorded after 2-3",
     "  reasonable keyword attempts all return 0 matches.",
     "- Use the user's exact wording as one of the queries when possible.",
+    "",
+    "**When formulating the final answer from search results:**",
+    "- List ALL relevant bullet points / facts you found in archive matches,",
+    "  do not over-summarize. The user often wants the complete enumeration",
+    "  (e.g. \"What was discussed in the workshop?\" expects the full list",
+    "  the original speaker gave, not just the headline).",
+    "- Quote the original wording when the question is about exact phrasing.",
   ].join("\n");
 }
 
