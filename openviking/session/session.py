@@ -1498,7 +1498,7 @@ class Session:
             logger.warning(
                 "WM update tool_call failed (%s); falling back to creation prompt", e
             )
-            return await self._fallback_generate_wm_creation(formatted, messages)
+            return await self._fallback_generate_wm_creation(formatted, messages, latest_archive_overview)
 
         has_tc = bool(getattr(resp, "has_tool_calls", False) and getattr(resp, "tool_calls", None))
         _preview = (str(resp)[:200]).replace(chr(10), " ")
@@ -1513,7 +1513,7 @@ class Session:
             logger.warning(
                 "WM update: LLM returned no tool_call; falling back to creation prompt"
             )
-            return await self._fallback_generate_wm_creation(formatted, messages)
+            return await self._fallback_generate_wm_creation(formatted, messages, latest_archive_overview)
 
         try:
             raw_args = resp.tool_calls[0].arguments
@@ -1613,7 +1613,7 @@ class Session:
                 "regex recovery found nothing; falling back to creation prompt",
                 e,
             )
-            return await self._fallback_generate_wm_creation(formatted, messages)
+            return await self._fallback_generate_wm_creation(formatted, messages, latest_archive_overview)
 
         _wm_debug(
             f"ops keys={list(ops.keys())[:7]} "
@@ -1625,14 +1625,23 @@ class Session:
         self,
         formatted_messages: str,
         messages: List[Message],
+        prior_overview: str = "",
     ) -> str:
-        """Re-run WM creation prompt when the update tool_call path fails."""
+        """Re-run WM creation prompt when the update tool_call path fails.
+
+        Passes ``prior_overview`` so the creation prompt can incorporate
+        accumulated context instead of generating from scratch.
+        """
+        _wm_debug(
+            f"fallback creation prompt: prior_overview={len(prior_overview)}B "
+            f"messages={len(messages)}"
+        )
         try:
             from openviking.prompts import render_prompt
 
             prompt = render_prompt(
                 "compression.ov_wm_v2",
-                {"messages": formatted_messages, "latest_archive_overview": ""},
+                {"messages": formatted_messages, "latest_archive_overview": prior_overview},
             )
             return await get_openviking_config().vlm.get_completion_async(prompt)
         except Exception as e:
