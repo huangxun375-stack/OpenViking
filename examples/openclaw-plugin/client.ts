@@ -802,6 +802,47 @@ export class OpenVikingClient {
     );
   }
 
+  /**
+   * Grep across the archived messages.jsonl files of one session.
+   * Thin wrapper over OV's `/api/v1/search/grep` scoped to
+   * `viking://session/{sid}/history` (or a single archive if specified).
+   * Returns raw matches with line numbers and full jsonl content; callers
+   * are responsible for any further parsing / windowing.
+   */
+  async grepSessionArchives(
+    sessionId: string,
+    pattern: string,
+    options: {
+      archiveId?: string;
+      caseInsensitive?: boolean;
+      nodeLimit?: number;
+      levelLimit?: number;
+      agentId?: string;
+    } = {},
+  ): Promise<{
+    matches: Array<{ line: number; uri: string; content: string }>;
+    count: number;
+    match_count?: number;
+    files_scanned?: number;
+  }> {
+    const baseUri = `viking://session/${sessionId}/history`;
+    const uri = options.archiveId ? `${baseUri}/${options.archiveId}` : baseUri;
+    return this.request(
+      "/api/v1/search/grep",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          uri,
+          pattern,
+          case_insensitive: options.caseInsensitive ?? true,
+          ...(options.nodeLimit !== undefined ? { node_limit: options.nodeLimit } : {}),
+          ...(options.levelLimit !== undefined ? { level_limit: options.levelLimit } : {}),
+        }),
+      },
+      options.agentId,
+    );
+  }
+
   async deleteSession(sessionId: string, agentId?: string): Promise<void> {
     await this.request(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" }, agentId);
   }
