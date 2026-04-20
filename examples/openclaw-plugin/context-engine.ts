@@ -1,6 +1,4 @@
 import { createHash } from "node:crypto";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import { DEFAULT_PHASE2_POLL_TIMEOUT_MS } from "./client.js";
 import type { OpenVikingClient, OVMessage } from "./client.js";
 import type { MemoryOpenVikingConfig } from "./config.js";
@@ -412,7 +410,7 @@ function buildSystemPromptAddition(): string {
     "1. **[Session History Summary]** — A compressed summary of all prior turns",
     "   in this session. Use it for background and continuity.",
     "   The summary is lossy: specific details (commands, file paths, code,",
-    "   config values, exact wording, dates, numbers) may have been compressed away.",
+    "   config values) may have been compressed away.",
     "",
     "2. **Active messages** — The most recent uncompressed turns.",
     "",
@@ -420,38 +418,8 @@ function buildSystemPromptAddition(): string {
     "- When active messages conflict with the Summary, trust active messages",
     "  as the newer source of truth.",
     "- Do not fabricate details the Summary does not state explicitly.",
-    "",
-    "**Retrieving missing details from archives — MANDATORY before \"no information\":**",
-    "",
-    "If the Summary above does NOT clearly state the specific detail the user",
-    "is asking about (a date, a name, an exact quote, a value, a reason, an",
-    "opinion someone expressed, what someone thought/felt/decided about",
-    "something), you MUST call the `ov_archive_search` tool BEFORE answering.",
-    "",
-    "Rules:",
-    "- The Summary is lossy — it deliberately drops opinions, reactions,",
-    "  details, and exact wording. The original transcripts are still in archives.",
-    "- It is FORBIDDEN to reply \"there is no information\" / \"no specific",
-    "  information\" / \"no mention of\" without first calling ov_archive_search",
-    "  with at least 2 different keywords from the user's question.",
-    "- The original conversations often use different words than the question",
-    "  — try synonyms (e.g. question says \"adopt\" → also try \"adoption\",",
-    "  \"single parent\", \"agency\"; question says \"feel\" → try the topic noun).",
-    "- For sentiment / status / relationship questions, also try the implied",
-    "  underlying nouns: \"relationship status\" → also try \"breakup\", \"single\",",
-    "  \"alone\", \"dating\"; \"how does X feel about Y\" → also try Y itself; ",
-    "  \"X realized\" → also try \"important\", \"matters\", the topic noun.",
-    "- If the first search returns 0 matches, try a different keyword before",
-    "  giving up. Only conclude the information isn't recorded after 2-3",
-    "  reasonable keyword attempts all return 0 matches.",
-    "- Use the user's exact wording as one of the queries when possible.",
-    "",
-    "**When formulating the final answer from search results:**",
-    "- List ALL relevant bullet points / facts you found in archive matches,",
-    "  do not over-summarize. The user often wants the complete enumeration",
-    "  (e.g. \"What was discussed in the workshop?\" expects the full list",
-    "  the original speaker gave, not just the headline).",
-    "- Quote the original wording when the question is about exact phrasing.",
+    "- When a specific detail is missing and you need it, ask the user rather",
+    "  than guess.",
   ].join("\n");
 }
 
@@ -600,132 +568,6 @@ export function createMemoryOpenVikingContextEngine(params: {
 
   const isBypassedSession = (params: { sessionId?: string; sessionKey?: string }): boolean =>
     shouldBypassSession(params, bypassSessionPatterns);
-
-  // === DEBUG: dump assemble snapshots when env OV_DUMP_ASSEMBLE_DIR is set ===
-  // For each assemble() call, writes a markdown snapshot containing the input
-  // messages, OV-fetched context (archive overview / pre-archive abstracts /
-  // active OV messages), the final injected (sanitized) messages, the system
-  // prompt addition, and token accounting. Used for benchmark per-question
-  // diagnosis. No-op when env var is empty / unset.
-  const dumpDir = (process.env.OV_DUMP_ASSEMBLE_DIR ?? "").trim();
-  let dumpSeq = 0;
-
-  function _renderMessagesForDump(label: string, msgs: unknown): string {
-    const arr = Array.isArray(msgs) ? msgs : [];
-    const lines: string[] = [`### ${label} (${arr.length} message(s))`, ""];
-    arr.forEach((m, i) => {
-      const mm = m as { role?: string; content?: unknown; parts?: unknown };
-      const role = mm?.role ?? "(no-role)";
-      let body: string;
-      // OVMessage uses `parts` (array of OVMessagePart); AgentMessage uses `content`
-      if (Array.isArray(mm.parts)) {
-        try {
-          body = JSON.stringify(mm.parts, null, 2);
-        } catch {
-          body = String(mm.parts);
-        }
-      } else if (typeof mm.content === "string") {
-        body = mm.content;
-      } else if (mm.content !== undefined) {
-        try {
-          body = JSON.stringify(mm.content, null, 2);
-        } catch {
-          body = String(mm.content);
-        }
-      } else {
-        body = "(no content/parts)";
-      }
-      lines.push(`#### [${i}] role=${role}`);
-      lines.push("```");
-      lines.push(body);
-      lines.push("```");
-      lines.push("");
-    });
-    return lines.join("\n");
-  }
-
-  function _renderAssembleSnapshotMarkdown(snap: Record<string, unknown>): string {
-    const out: string[] = [];
-    out.push(`# Assemble snapshot`);
-    out.push("");
-    out.push(`- timestamp: ${snap.timestamp}`);
-    out.push(`- seq: ${snap.seq}`);
-    out.push(`- sessionId: ${snap.sessionId}`);
-    out.push(`- ovSessionId: ${snap.ovSessionId}`);
-    out.push(`- sessionKey: ${snap.sessionKey ?? "(none)"}`);
-    out.push(`- agentId: ${snap.agentId ?? "(none)"}`);
-    out.push(`- branch: ${snap.branch ?? "ok"}`);
-    out.push(`- tokenBudget: ${snap.tokenBudget}`);
-    out.push(`- originalTokens (input): ${snap.originalTokens}`);
-    out.push(`- assembledTokens (sanitized + instruction): ${snap.assembledTokens}`);
-    out.push(`- tokensSaved: ${snap.tokensSaved} (${snap.savingPct}%)`);
-    out.push(`- archiveCount (preAbstracts): ${snap.archiveCount}`);
-    out.push(`- activeCount (ovMessages): ${snap.activeCount}`);
-    out.push(`- archive tokens: ${snap.archiveTokens} / budget ${snap.archiveBudget}`);
-    out.push(`- session tokens: ${snap.sessionTokens} / budget ${snap.sessionBudget}`);
-    out.push(`- reserved budget: ${snap.reservedBudget}`);
-    out.push("");
-
-    out.push(`## OV ctx fetched`);
-    out.push("");
-    out.push(`### Latest archive overview (Working Memory injected as user message)`);
-    out.push("");
-    out.push("```markdown");
-    out.push(String(snap.latestArchiveOverview ?? "(none)"));
-    out.push("```");
-    out.push("");
-    out.push(`### Pre-archive abstracts (${(snap.preAbstracts as unknown[] | undefined)?.length ?? 0})`);
-    const pa = snap.preAbstracts as Array<{ archive_id?: string; abstract?: string }> | undefined;
-    if (pa && pa.length > 0) {
-      pa.forEach((a) => {
-        out.push(`- **${a.archive_id ?? "?"}**: ${a.abstract ?? ""}`);
-      });
-    } else {
-      out.push(`(none)`);
-    }
-    out.push("");
-
-    out.push(_renderMessagesForDump("OV active messages (ctx.messages)", snap.ovMessages));
-    out.push(_renderMessagesForDump("Input messages (passed in by OpenClaw)", snap.inputMessages));
-    out.push(_renderMessagesForDump("Final injected messages (= sanitized → sent to LLM)", snap.sanitizedMessages));
-
-    out.push(`## System prompt addition (instruction)`);
-    out.push("");
-    out.push("```");
-    out.push(String(snap.instructionText ?? "(none)"));
-    out.push("```");
-    out.push("");
-
-    if (snap.error) {
-      out.push(`## Error`);
-      out.push("");
-      out.push("```");
-      out.push(String(snap.error));
-      out.push("```");
-    }
-    return out.join("\n");
-  }
-
-  function tryDumpAssembleSnapshot(snap: Record<string, unknown>): void {
-    if (!dumpDir) return;
-    try {
-      if (!fs.existsSync(dumpDir)) {
-        fs.mkdirSync(dumpDir, { recursive: true });
-      }
-      dumpSeq += 1;
-      const seq = String(dumpSeq).padStart(4, "0");
-      const ts = new Date().toISOString().replace(/[:.]/g, "-");
-      const keyForHash = String(snap.sessionKey ?? snap.ovSessionId ?? "");
-      const sessionKeyHash = createHash("sha1").update(keyForHash).digest("hex").substring(0, 6);
-      const fname = `assemble_${ts}_q${seq}_${sessionKeyHash}.md`;
-      const filledSnap = { ...snap, seq, timestamp: new Date().toISOString() };
-      const md = _renderAssembleSnapshotMarkdown(filledSnap);
-      fs.writeFileSync(path.join(dumpDir, fname), md, "utf-8");
-    } catch (e) {
-      logger.warn?.(`openviking: assemble dump failed: ${String(e)}`);
-    }
-  }
-  // === END DEBUG DUMP ===
 
   async function doCommitOVSession(sessionId: string, sessionKey?: string): Promise<boolean> {
     if (isBypassedSession({ sessionId, sessionKey })) {
@@ -988,32 +830,6 @@ export function createMemoryOpenVikingContextEngine(params: {
           sessionBudget: budgets.sessionContext,
           reservedBudget: budgets.reserved,
           messages: messageDigest(sanitized),
-        });
-
-        tryDumpAssembleSnapshot({
-          sessionId: assembleParams.sessionId,
-          ovSessionId: OVSessionId,
-          sessionKey,
-          agentId,
-          branch: "ok",
-          tokenBudget,
-          originalTokens,
-          assembledTokens,
-          tokensSaved,
-          savingPct,
-          archiveCount: preAbstracts.length,
-          activeCount,
-          archiveTokens: archive.tokens,
-          archiveBudget: budgets.archiveMemory,
-          sessionTokens: session.tokens,
-          sessionBudget: budgets.sessionContext,
-          reservedBudget: budgets.reserved,
-          latestArchiveOverview: ctx.latest_archive_overview,
-          preAbstracts,
-          ovMessages: ctx.messages,
-          inputMessages: messages,
-          sanitizedMessages: sanitized,
-          instructionText: instruction.text,
         });
 
         return {
