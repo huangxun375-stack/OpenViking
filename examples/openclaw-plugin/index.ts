@@ -1294,12 +1294,11 @@ const mergeFindResults = (results: FindResult[]): FindResult => {
       description:
         "Retrieve original messages from a compressed session archive. " +
         "Use when a session summary lacks specific details " +
-        "such as exact commands, file paths, code snippets, or config values. " +
-        "Check [Archive Index] to find the right archive ID.",
+        "such as exact commands, file paths, code snippets, or config values.",
       parameters: Type.Object({
         archiveId: Type.String({
           description:
-            'Archive ID from [Archive Index] (e.g. "archive_002")',
+            'Archive ID (e.g. "archive_002")',
         }),
       }),
       async execute(_toolCallId: string, params: Record<string, unknown>) {
