@@ -1,0 +1,22 @@
+case_id: correction_task_status
+title: Correction task status
+mode: chat_e2e
+capability: correction
+priority: critical
+tags:
+  - overwrite
+  - smoke
+turns:
+  - role: user
+    content: "Remember: benchmark step 1 is blocked."
+  - role: user
+    content: "Correction: benchmark step 1 is unblocked and ready for implementation."
+checkpoints:
+  - id: cp_after_turn
+    trigger: after_turn
+    query: "Is benchmark step 1 blocked or unblocked?"
+    expected_any:
+      - "unblocked"
+    forbidden_any:
+      - "blocked"
+    source_expectation: tail

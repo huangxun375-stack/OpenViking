@@ -1,0 +1,30 @@
+case_id: growth_append_only_key_facts
+title: Growth append only key facts
+mode: artifact_whitebox
+capability: growth_control
+priority: normal
+tags:
+  - growth
+  - smoke
+turns:
+  - role: user
+    content: "Remember durable fact alpha."
+  - role: user
+    content: "Remember durable fact beta."
+  - role: user
+    content: "Remember durable fact gamma."
+checkpoints:
+  - id: cp_after_async_commit
+    trigger: after_async_commit
+    query: "Name one durable fact from the session."
+    expected_any:
+      - "alpha"
+      - "beta"
+      - "gamma"
+    source_expectation: any
+artifact_assertions:
+  section_contains:
+    Key Facts & Decisions:
+      - "alpha"
+      - "beta"
+      - "gamma"

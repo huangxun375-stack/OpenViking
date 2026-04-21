@@ -1,0 +1,21 @@
+case_id: correction_preference_override
+title: Correction preference override
+mode: chat_e2e
+capability: correction
+priority: normal
+tags:
+  - overwrite
+turns:
+  - role: user
+    content: "Remember: the user prefers broad summaries."
+  - role: user
+    content: "Correction: the user prefers concise summaries."
+checkpoints:
+  - id: cp_after_turn
+    trigger: after_turn
+    query: "What summary style does the user prefer?"
+    expected_any:
+      - "concise"
+    forbidden_any:
+      - "broad"
+    source_expectation: tail

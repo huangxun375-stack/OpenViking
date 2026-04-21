@@ -1,0 +1,18 @@
+case_id: wm_open_issue_continuity_after_compact
+title: WM open issue continuity after compact
+mode: chat_e2e
+capability: wm_durable_recall
+priority: normal
+tags:
+  - wm
+  - compact
+turns:
+  - role: user
+    content: "Remember: the next unresolved task is to run a live smoke benchmark."
+checkpoints:
+  - id: cp_after_compact
+    trigger: after_compact
+    query: "What is the unresolved task?"
+    expected_any:
+      - "live smoke benchmark"
+    source_expectation: wm_required

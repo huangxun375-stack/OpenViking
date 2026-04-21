@@ -1,0 +1,17 @@
+case_id: tail_recent_file_focus
+title: Tail recent file focus
+mode: chat_e2e
+capability: tail_recall
+priority: critical
+tags:
+  - tail
+turns:
+  - role: user
+    content: "Remember: the current file in focus is openviking/session/session.py."
+checkpoints:
+  - id: cp_after_turn
+    trigger: after_turn
+    query: "Which file is in focus right now?"
+    expected_any:
+      - "openviking/session/session.py"
+    source_expectation: tail

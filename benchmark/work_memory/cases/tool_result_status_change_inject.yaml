@@ -1,0 +1,29 @@
+case_id: tool_result_status_change_inject
+title: Tool result status change inject
+mode: session_inject
+capability: tool_grounded_memory
+priority: normal
+tags:
+  - tool
+turns:
+  - role: assistant
+    tool_name: check_deploy
+    tool_input:
+      service: "benchmark-runner"
+    tool_output:
+      deploy_status: "failed"
+  - role: assistant
+    tool_name: check_deploy
+    tool_input:
+      service: "benchmark-runner"
+    tool_output:
+      deploy_status: "healthy"
+checkpoints:
+  - id: cp_after_async_commit
+    trigger: after_async_commit
+    query: "What is the current deploy status?"
+    expected_any:
+      - "healthy"
+    forbidden_any:
+      - "failed"
+    source_expectation: tool_evidence

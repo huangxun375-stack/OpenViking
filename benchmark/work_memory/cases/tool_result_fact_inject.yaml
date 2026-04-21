@@ -1,0 +1,22 @@
+case_id: tool_result_fact_inject
+title: Tool result fact inject
+mode: session_inject
+capability: tool_grounded_memory
+priority: normal
+tags:
+  - tool
+  - smoke
+turns:
+  - role: assistant
+    tool_name: read_config
+    tool_input:
+      path: "config/app.yaml"
+    tool_output:
+      current_env: "staging"
+checkpoints:
+  - id: cp_after_async_commit
+    trigger: after_async_commit
+    query: "工具结果里的当前环境是什么？"
+    expected_any:
+      - "staging"
+    source_expectation: tool_evidence

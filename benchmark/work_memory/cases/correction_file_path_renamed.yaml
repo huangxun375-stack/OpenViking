@@ -1,0 +1,27 @@
+case_id: correction_file_path_renamed
+title: Correction file path renamed
+mode: chat_e2e
+capability: correction
+priority: critical
+tags:
+  - overwrite
+  - file-path
+turns:
+  - role: user
+    content: "Remember: the report lives at benchmark/work_memory/output.md."
+  - role: user
+    content: "Correction: the report lives at benchmark/work_memory/report.md and output.md is the old path."
+checkpoints:
+  - id: cp_after_turn
+    trigger: after_turn
+    query: "Where does the report live now?"
+    expected_any:
+      - "benchmark/work_memory/report.md"
+    forbidden_any:
+      - "benchmark/work_memory/output.md"
+    source_expectation: tail
+artifact_assertions:
+  wm_must_contain:
+    - "benchmark/work_memory/report.md"
+  wm_may_contain_only_as_historical:
+    - "benchmark/work_memory/output.md"

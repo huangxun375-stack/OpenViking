@@ -6,41 +6,33 @@ import glob
 import importlib.util
 import logging
 import os
-import sys
 import sysconfig
 from pathlib import Path
 
 from .client import AGFSClient, FileHandle
 from .exceptions import (
-    AGFSAlreadyExistsError,
     AGFSClientError,
-    AGFSConfigError,
     AGFSConnectionError,
-    AGFSDirectoryNotEmptyError,
-    AGFSFileExistsError,
     AGFSHTTPError,
-    AGFSInternalError,
-    AGFSInvalidOperationError,
-    AGFSInvalidPathError,
-    AGFSIoError,
-    AGFSIsADirectoryError,
-    AGFSMountPointExistsError,
-    AGFSMountPointNotFoundError,
-    AGFSNetworkError,
-    AGFSNotADirectoryError,
-    AGFSNotFoundError,
     AGFSNotSupportedError,
-    AGFSPermissionDeniedError,
-    AGFSPluginError,
-    AGFSSerializationError,
     AGFSTimeoutError,
 )
 from .helpers import cp, download, upload
 
 _logger = logging.getLogger(__name__)
 
-# Directory that ships pre-built native libraries (Rust .so/.dylib).
+# Directory that ships pre-built native libraries (Go .so/.dylib and Rust .so/.dylib).
 _LIB_DIR = Path(__file__).resolve().parent.parent / "lib"
+
+# ---------------------------------------------------------------------------
+# Binding implementation selection via RAGFS_IMPL environment variable.
+#
+#   RAGFS_IMPL=auto  (default) — Rust first, Go fallback
+#   RAGFS_IMPL=rust             — Rust only, error if unavailable
+#   RAGFS_IMPL=go               — Go only, error if unavailable
+# ---------------------------------------------------------------------------
+
+_RAGFS_IMPL_ENV = os.environ.get("RAGFS_IMPL", "").lower() or None
 
 
 def _find_ragfs_so():
@@ -50,19 +42,12 @@ def _find_ragfs_so():
     """
     try:
         ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
-        # Exact match first: ragfs_python.cpython-312-darwin.so or ragfs_python.abi3.so
+        # Exact match first: ragfs_python.cpython-312-darwin.so
         exact = _LIB_DIR / f"ragfs_python{ext_suffix}"
         if exact.exists():
             return str(exact)
-        # Try abi3 suffix explicitly first (stable ABI)
-        abi3_suffix = ".abi3.so"
-        if sys.platform == "win32":
-            abi3_suffix = ".abi3.pyd"
-        abi3_exact = _LIB_DIR / f"ragfs_python{abi3_suffix}"
-        if abi3_exact.exists():
-            return str(abi3_exact)
-        # Glob fallback: ragfs_python.cpython-*, ragfs_python.abi3.*, ragfs_python.*.pyd
-        for pattern in ("ragfs_python.cpython-*", "ragfs_python.abi3.*", "ragfs_python.*"):
+        # Glob fallback: ragfs_python.cpython-*.so / ragfs_python.*.pyd
+        for pattern in ("ragfs_python.cpython-*", "ragfs_python.*"):
             matches = glob.glob(str(_LIB_DIR / pattern))
             if matches:
                 return matches[0]
@@ -93,39 +78,94 @@ def _load_rust_binding():
         raise ImportError("Rust binding not available")
 
 
-def get_binding_client():
-    """Get the RAGFS binding client class.
+def _load_go_binding():
+    """Attempt to load the Go (ctypes) binding client."""
+    try:
+        from .binding_client import AGFSBindingClient as _Go
+        from .binding_client import FileHandle as _GoFH
+
+        return _Go, _GoFH
+    except Exception:
+        raise ImportError("Go binding not available")
+
+
+def _resolve_binding(impl: str):
+    """Return (AGFSBindingClient, BindingFileHandle) based on *impl*.
+
+    *impl* should be one of ``"auto"``, ``"rust"``, or ``"go"``.
+    """
+
+    if impl == "rust":
+        try:
+            client, fh = _load_rust_binding()
+            _logger.info("RAGFS_IMPL=rust: loaded Rust binding")
+            return client, fh
+        except ImportError as exc:
+            raise ImportError(
+                "RAGFS_IMPL=rust but ragfs_python native library is not available: " + str(exc)
+            ) from exc
+
+    if impl == "go":
+        try:
+            client, fh = _load_go_binding()
+            _logger.info("RAGFS_IMPL=go: loaded Go binding")
+            return client, fh
+        except (ImportError, OSError) as exc:
+            raise ImportError(
+                "RAGFS_IMPL=go but Go binding (libagfsbinding) is not available: " + str(exc)
+            ) from exc
+
+    if impl == "auto":
+        # Rust first, Go fallback, silent None if neither available
+        try:
+            client, fh = _load_rust_binding()
+            _logger.info("RAGFS_IMPL=auto: loaded Rust binding (ragfs-python)")
+            return client, fh
+        except Exception:
+            pass
+
+        try:
+            client, fh = _load_go_binding()
+            _logger.info("RAGFS_IMPL=auto: Rust unavailable, loaded Go binding (libagfsbinding)")
+            return client, fh
+        except Exception:
+            pass
+
+        _logger.warning(
+            "RAGFS_IMPL=auto: neither Rust nor Go binding available; AGFSBindingClient will be None"
+        )
+        return None, None
+
+    raise ValueError(f"Invalid RAGFS_IMPL value: '{impl}'. Must be one of: auto, rust, go")
+
+
+def get_binding_client(config_impl: str = "auto"):
+    """Resolve binding classes with env-var override.
+
+    Priority: ``RAGFS_IMPL`` env var  >  *config_impl*  >  ``"auto"``
 
     Returns:
-        ``(RAGFSBindingClient_class, BindingFileHandle_class)``
+        ``(AGFSBindingClient_class, BindingFileHandle_class)``
     """
-    try:
-        client, fh = _load_rust_binding()
-        _logger.info("Loaded RAGFS Rust binding")
-        return client, fh
-    except ImportError as exc:
-        raise ImportError("ragfs_python native library is not available: " + str(exc)) from exc
+    effective = _RAGFS_IMPL_ENV or config_impl or "auto"
+    return _resolve_binding(effective)
 
 
-# Module-level defaults
+# Module-level defaults (used when importing ``from openviking.pyagfs import AGFSBindingClient``)
 # Ensure module import never fails, even if bindings are unavailable
 try:
-    RAGFSBindingClient, BindingFileHandle = get_binding_client()
-    # Backward compatibility alias
-    AGFSBindingClient = RAGFSBindingClient
+    AGFSBindingClient, BindingFileHandle = _resolve_binding(_RAGFS_IMPL_ENV or "auto")
 except Exception:
     _logger.warning(
-        "Failed to initialize RAGFSBindingClient during module import; "
-        "RAGFSBindingClient will be None. Use get_binding_client() for explicit handling."
+        "Failed to initialize AGFSBindingClient during module import; "
+        "AGFSBindingClient will be None. Use get_binding_client() for explicit handling."
     )
-    RAGFSBindingClient = None
     AGFSBindingClient = None
     BindingFileHandle = None
 
 __all__ = [
     "AGFSClient",
     "AGFSBindingClient",
-    "RAGFSBindingClient",
     "FileHandle",
     "BindingFileHandle",
     "get_binding_client",
@@ -134,23 +174,6 @@ __all__ = [
     "AGFSTimeoutError",
     "AGFSHTTPError",
     "AGFSNotSupportedError",
-    "AGFSNotFoundError",
-    "AGFSAlreadyExistsError",
-    "AGFSFileExistsError",
-    "AGFSPermissionDeniedError",
-    "AGFSInvalidPathError",
-    "AGFSNotADirectoryError",
-    "AGFSIsADirectoryError",
-    "AGFSDirectoryNotEmptyError",
-    "AGFSInvalidOperationError",
-    "AGFSIoError",
-    "AGFSConfigError",
-    "AGFSMountPointNotFoundError",
-    "AGFSMountPointExistsError",
-    "AGFSSerializationError",
-    "AGFSNetworkError",
-    "AGFSInternalError",
-    "AGFSPluginError",
     "cp",
     "upload",
     "download",

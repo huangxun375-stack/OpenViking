@@ -1,0 +1,33 @@
+case_id: tool_error_then_fix_inject
+title: Tool error then fix inject
+mode: session_inject
+capability: tool_grounded_memory
+priority: normal
+expected_failure: true
+tags:
+  - tool
+  - correction
+turns:
+  - role: assistant
+    tool_name: run_tests
+    tool_input:
+      target: "tests/unit/benchmark"
+    tool_output:
+      result: "ImportError"
+    tool_status: "failed"
+  - role: assistant
+    tool_name: run_tests
+    tool_input:
+      target: "tests/unit/benchmark"
+    tool_output:
+      result: "21 passed"
+    tool_status: "completed"
+checkpoints:
+  - id: cp_after_async_commit
+    trigger: after_async_commit
+    query: "What was the final test result?"
+    expected_any:
+      - "21 passed"
+    forbidden_any:
+      - "ImportError"
+    source_expectation: tool_evidence

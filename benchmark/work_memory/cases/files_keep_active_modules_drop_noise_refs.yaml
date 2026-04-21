@@ -1,0 +1,27 @@
+case_id: files_keep_active_modules_drop_noise_refs
+title: Files keep active modules drop noise refs
+mode: chat_e2e
+capability: files_context_pruning
+priority: normal
+expected_failure: true
+tags:
+  - files
+  - pruning
+turns:
+  - role: user
+    content: "Remember the active modules are benchmark/work_memory/src/runner.py and benchmark/work_memory/src/probes.py."
+  - role: user
+    content: "The noise references are docs/old-a.md and docs/old-b.md."
+checkpoints:
+  - id: cp_after_compact
+    trigger: after_compact
+    query: "Which modules are active?"
+    expected_any:
+      - "benchmark/work_memory/src/runner.py"
+    source_expectation: wm_candidate
+artifact_assertions:
+  key_file_paths_present:
+    - "benchmark/work_memory/src/runner.py"
+    - "benchmark/work_memory/src/probes.py"
+  wm_must_not_contain:
+    - "docs/old-b.md"

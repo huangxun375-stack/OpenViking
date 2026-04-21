@@ -1,0 +1,17 @@
+case_id: tail_recent_goal_shift
+title: Tail recent goal shift
+mode: chat_e2e
+capability: tail_recall
+priority: normal
+tags:
+  - tail
+turns:
+  - role: user
+    content: "Remember: the goal has shifted from drafting the spec to implementing the benchmark."
+checkpoints:
+  - id: cp_after_turn
+    trigger: after_turn
+    query: "What is the goal now?"
+    expected_any:
+      - "implementing the benchmark"
+    source_expectation: tail

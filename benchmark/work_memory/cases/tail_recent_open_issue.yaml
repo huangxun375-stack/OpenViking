@@ -1,0 +1,17 @@
+case_id: tail_recent_open_issue
+title: Tail recent open issue
+mode: chat_e2e
+capability: tail_recall
+priority: normal
+tags:
+  - tail
+turns:
+  - role: user
+    content: "Remember: the open issue is whether live smoke runs will pass on the local stack."
+checkpoints:
+  - id: cp_after_turn
+    trigger: after_turn
+    query: "What is the open issue?"
+    expected_any:
+      - "live smoke runs"
+    source_expectation: tail

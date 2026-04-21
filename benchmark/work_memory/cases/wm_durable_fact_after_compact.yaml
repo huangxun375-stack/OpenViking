@@ -1,0 +1,19 @@
+case_id: wm_durable_fact_after_compact
+title: WM durable fact after compact
+mode: chat_e2e
+capability: wm_durable_recall
+priority: critical
+tags:
+  - wm
+  - compact
+  - smoke
+turns:
+  - role: user
+    content: "记住：历史事实是 delta。"
+checkpoints:
+  - id: cp_after_compact
+    trigger: after_compact
+    query: "历史事实是什么？"
+    expected_any:
+      - "delta"
+    source_expectation: wm_required

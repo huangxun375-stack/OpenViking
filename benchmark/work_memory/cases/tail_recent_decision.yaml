@@ -1,0 +1,17 @@
+case_id: tail_recent_decision
+title: Tail recent decision
+mode: chat_e2e
+capability: tail_recall
+priority: normal
+tags:
+  - tail
+turns:
+  - role: user
+    content: "Remember: we decided to keep deterministic matching in phase 1."
+checkpoints:
+  - id: cp_after_turn
+    trigger: after_turn
+    query: "What did we decide for phase 1 matching?"
+    expected_any:
+      - "deterministic matching"
+    source_expectation: tail

@@ -1,0 +1,27 @@
+case_id: correction_current_owner
+title: Correction current owner
+mode: chat_e2e
+capability: correction
+priority: critical
+tags:
+  - overwrite
+  - smoke
+turns:
+  - role: user
+    content: "记住：当前负责人是 Alice。"
+  - role: user
+    content: "更正一下，当前负责人改成 Bob，Alice 是之前的负责人。"
+checkpoints:
+  - id: cp_after_turn
+    trigger: after_turn
+    query: "现在的负责人是谁？"
+    expected_any:
+      - "Bob"
+    forbidden_any:
+      - "Alice"
+    source_expectation: tail
+artifact_assertions:
+  wm_must_contain:
+    - "Bob"
+  wm_may_contain_only_as_historical:
+    - "Alice"

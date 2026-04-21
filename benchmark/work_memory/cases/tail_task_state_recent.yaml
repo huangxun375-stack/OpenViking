@@ -1,0 +1,18 @@
+case_id: tail_task_state_recent
+title: Tail task state recent
+mode: chat_e2e
+capability: tail_recall
+priority: critical
+tags:
+  - tail
+  - smoke
+turns:
+  - role: user
+    content: "Remember: the next step is to rerun the benchmark list command."
+checkpoints:
+  - id: cp_after_turn
+    trigger: after_turn
+    query: "What is the next step right now?"
+    expected_any:
+      - "rerun the benchmark list command"
+    source_expectation: tail

@@ -1,0 +1,24 @@
+case_id: wm_durable_decision_after_many_turns
+title: WM durable decision after many turns
+mode: chat_e2e
+capability: wm_durable_recall
+priority: normal
+tags:
+  - wm
+  - compact
+turns:
+  - role: user
+    content: "Remember: the benchmark should stay additive and not modify core OpenClaw behavior."
+  - role: user
+    content: "Side note one."
+  - role: user
+    content: "Side note two."
+  - role: user
+    content: "Side note three."
+checkpoints:
+  - id: cp_after_compact
+    trigger: after_compact
+    query: "What is the key implementation constraint?"
+    expected_any:
+      - "not modify core OpenClaw behavior"
+    source_expectation: wm_required

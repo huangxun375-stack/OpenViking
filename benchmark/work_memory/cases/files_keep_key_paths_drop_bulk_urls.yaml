@@ -1,0 +1,27 @@
+case_id: files_keep_key_paths_drop_bulk_urls
+title: Files keep key paths drop bulk urls
+mode: chat_e2e
+capability: files_context_pruning
+priority: normal
+expected_failure: true
+tags:
+  - files
+  - pruning
+turns:
+  - role: user
+    content: "Remember these key paths: benchmark/work_memory/run.py and benchmark/work_memory/src/report.py. Ignore this noise URL: https://example.com/noise/a"
+  - role: user
+    content: "Also ignore this noise URL: https://example.com/noise/b"
+checkpoints:
+  - id: cp_after_compact
+    trigger: after_compact
+    query: "Which benchmark paths matter?"
+    expected_any:
+      - "benchmark/work_memory/run.py"
+    source_expectation: wm_candidate
+artifact_assertions:
+  key_file_paths_present:
+    - "benchmark/work_memory/run.py"
+    - "benchmark/work_memory/src/report.py"
+  wm_must_not_contain:
+    - "https://example.com/noise/b"

@@ -109,6 +109,12 @@ class CollectionAdapter(ABC):
         index_name: str,
     ) -> bool:
         if self.collection_exists():
+            self._ensure_index_exists(
+                index_name=index_name,
+                schema=schema,
+                distance=distance,
+                sparse_weight=sparse_weight,
+            )
             return False
 
         self._collection_name = name
@@ -133,6 +139,40 @@ class CollectionAdapter(ABC):
         )
         self._collection.create_index(index_name, index_meta)
         return True
+
+    def _ensure_index_exists(
+        self,
+        index_name: str,
+        schema: Dict[str, Any],
+        distance: str,
+        sparse_weight: float,
+    ) -> None:
+        """Check if the expected index exists on the loaded collection; create if missing."""
+        try:
+            coll = self.get_collection()
+            existing = coll.list_indexes() or []
+            if index_name in existing:
+                return
+            logger.warning(
+                "Index '%s' missing on existing collection '%s', rebuilding from store data",
+                index_name,
+                self._collection_name,
+            )
+            scalar_index_fields = self._sanitize_scalar_index_fields(
+                scalar_index_fields=schema.get("ScalarIndex", []),
+                fields_meta=schema.get("Fields", []),
+            )
+            index_meta = self._build_default_index_meta(
+                index_name=index_name,
+                distance=distance,
+                use_sparse=sparse_weight > 0.0,
+                sparse_weight=sparse_weight,
+                scalar_index_fields=scalar_index_fields,
+            )
+            coll.create_index(index_name, index_meta)
+            logger.info("Index '%s' rebuilt successfully", index_name)
+        except Exception as e:
+            logger.error("Failed to ensure index '%s' exists: %s", index_name, e)
 
     def drop_collection(self) -> bool:
         if not self.collection_exists():

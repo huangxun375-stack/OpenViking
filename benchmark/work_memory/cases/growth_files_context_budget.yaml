@@ -1,0 +1,29 @@
+case_id: growth_files_context_budget
+title: Growth files context budget
+mode: artifact_whitebox
+capability: growth_control
+priority: normal
+expected_failure: true
+tags:
+  - growth
+  - budget
+turns:
+  - role: user
+    content: "Remember benchmark/work_memory/src/runner.py"
+  - role: user
+    content: "Remember benchmark/work_memory/src/report.py"
+  - role: user
+    content: "Remember benchmark/work_memory/src/openclaw_client.py"
+checkpoints:
+  - id: cp_after_async_commit
+    trigger: after_async_commit
+    query: "Name one file tracked in the benchmark context."
+    expected_any:
+      - "benchmark/work_memory/src/runner.py"
+    source_expectation: any
+budget_assertions:
+  max_total_wm_tokens: 64
+  max_section_tokens:
+    Files & Context: 32
+  max_section_items:
+    Files & Context: 2

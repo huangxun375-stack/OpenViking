@@ -1,0 +1,19 @@
+case_id: wm_cross_session_state_after_compact
+title: WM cross session state after compact
+mode: chat_e2e
+capability: wm_durable_recall
+priority: normal
+expected_failure: true
+tags:
+  - wm
+  - cross-session
+turns:
+  - role: user
+    content: "Remember: the previous session ended with branch feat/wm-v2-afterturn active."
+checkpoints:
+  - id: cp_after_compact
+    trigger: after_compact
+    query: "Which branch was active in the previous session?"
+    expected_any:
+      - "feat/wm-v2-afterturn"
+    source_expectation: wm_candidate
