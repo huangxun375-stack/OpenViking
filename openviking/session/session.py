@@ -1483,11 +1483,15 @@ class Session:
         # -------- Branch 2: has prior WM v2 -> tool_call incremental update --------
         _wm_debug(f"branch=UPDATE (prior WM={len(latest_archive_overview)}B)")
         try:
+            reminders = Session._build_wm_section_reminders(latest_archive_overview)
+            if reminders:
+                _wm_debug(f"section_reminders injected ({len(reminders)}B)")
             update_prompt = render_prompt(
                 "compression.ov_wm_v2_update",
                 {
                     "messages": formatted,
                     "latest_archive_overview": latest_archive_overview,
+                    "wm_section_reminders": reminders,
                 },
             )
             resp = await vlm.get_completion_async(
@@ -1684,13 +1688,48 @@ class Session:
             sections[current] = "\n".join(buf).strip()
         return sections
 
+    _WM_SECTION_BULLET_THRESHOLD = 25
+    _WM_SECTION_TOKEN_THRESHOLD = 1500
+
+    @staticmethod
+    def _build_wm_section_reminders(overview: str) -> str:
+        """Compute dynamic section-size warnings for the WM update prompt.
+
+        Scans the current overview, counts bullets and estimates tokens for
+        each section.  Returns an XML block that the prompt template can
+        inject verbatim so the LLM knows which sections need consolidation.
+        """
+        if not overview:
+            return ""
+        sections = Session._parse_wm_sections(overview)
+        warnings: List[str] = []
+        for header, body in sections.items():
+            name = header.lstrip("#").strip()
+            if name in Session._WM_APPEND_ONLY_SECTIONS:
+                continue
+            items = Session._wm_extract_bullet_items(body)
+            est_tokens = len(body) // 4
+            if (
+                len(items) > Session._WM_SECTION_BULLET_THRESHOLD
+                or est_tokens > Session._WM_SECTION_TOKEN_THRESHOLD
+            ):
+                warnings.append(
+                    f'WARNING: "{name}" has {len(items)} bullets '
+                    f"(~{est_tokens} tokens).\n"
+                    f"This section MUST be consolidated via UPDATE. Group "
+                    f"related facts by topic into category summaries. "
+                    f"Preserve names, dates, and exact values but merge "
+                    f"repetitive events into patterns.\n"
+                    f"Target: <={Session._WM_SECTION_BULLET_THRESHOLD} "
+                    f"bullets, <={Session._WM_SECTION_TOKEN_THRESHOLD} tokens."
+                )
+        if not warnings:
+            return ""
+        return "<section_size_warnings>\n" + "\n\n".join(warnings) + "\n</section_size_warnings>"
+
     # Sections where server enforces APPEND-only regardless of what the LLM emits.
-    # These represent monotonically-growing knowledge (decisions, errors) that
-    # must never shrink — empirically LLMs with long prompts cannot reliably
-    # carry forward prior content in an UPDATE, so we force APPEND semantics.
     _WM_APPEND_ONLY_SECTIONS = frozenset({
         "Errors & Corrections",
-        "Key Facts & Decisions",
     })
 
     # Very loose path-like token regex used to detect file paths that existed
@@ -1825,11 +1864,9 @@ class Session:
 
         new_content = (op.get("content") or "").strip()
         new_items = Session._wm_extract_bullet_items(new_content)
-        # Use loose contains-check to dedup items already present in old body.
         old_lower = (old_content or "").lower()
         fresh_items = []
         for it in new_items:
-            # Trim markdown emphasis so "_foo_" and "foo" dedup.
             key = it.strip("_* `").lower()
             if key and key not in old_lower:
                 fresh_items.append(it)
@@ -1840,6 +1877,150 @@ class Session:
         if not fresh_items:
             return {"op": "KEEP"}
         return {"op": "APPEND", "items": fresh_items}
+
+    _WM_KEY_FACTS_MIN_BULLET_RATIO = 0.15
+    _WM_KEY_FACTS_MIN_ANCHOR_COVERAGE = 0.70
+
+    _WM_ANCHOR_DATE_RE = re.compile(
+        r"\b\d{4}-\d{2}-\d{2}\b"
+        r"|\b\d{1,2}\s+(?:January|February|March|April|May|June"
+        r"|July|August|September|October|November|December)\s+\d{4}\b",
+        re.IGNORECASE,
+    )
+    _WM_ANCHOR_NUMBER_RE = re.compile(
+        r"\b\d+\s+(?:years?|months?|weeks?|days?|kids?|children"
+        r"|hours?|miles?|times?|sessions?|rounds?|visits?"
+        r"|dollars?|euros?|pounds?|bedrooms?|paintings?"
+        r"|people|persons?)\b"
+        r"|\$\d[\d,]*"
+        r"|\b\d+\s+(?:AM|PM)\b",
+        re.IGNORECASE,
+    )
+    _WM_ANCHOR_DECISION_RE = re.compile(
+        r"\b(?:because|decided|chose|committed|agreed|resolved)\b",
+        re.IGNORECASE,
+    )
+    _WM_ANCHOR_STOPWORDS = frozenset({
+        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for",
+        "with", "by", "at", "from", "is", "are", "was", "were", "has",
+        "have", "had", "been", "be", "will", "would", "could", "should",
+        "may", "might", "shall", "this", "that", "these", "those",
+        "not", "no", "but", "if", "then", "so", "as", "it", "its",
+        "they", "their", "them", "she", "her", "he", "him", "his",
+        "we", "our", "us", "you", "your", "who", "which", "what",
+        "when", "where", "how", "why", "all", "each", "every",
+        "both", "few", "more", "most", "other", "some", "such",
+        "than", "too", "very", "also", "just", "about", "after",
+        "before", "between", "into", "through", "during", "again",
+        "further", "once", "here", "there", "over", "under", "out",
+        "up", "down", "off", "own", "same", "only", "new", "old",
+        "key", "facts", "decisions", "session", "working", "memory",
+    })
+
+    @staticmethod
+    def _extract_lexical_anchors(text: str) -> set:
+        """Extract fact-preserving anchors: dates, numbers, proper nouns,
+        decision markers."""
+        anchors: set = set()
+        for m in Session._WM_ANCHOR_DATE_RE.finditer(text):
+            anchors.add(m.group().lower().strip())
+        for m in Session._WM_ANCHOR_NUMBER_RE.finditer(text):
+            anchors.add(m.group().lower().strip())
+        for m in Session._WM_ANCHOR_DECISION_RE.finditer(text):
+            anchors.add(m.group().lower().strip())
+        for token in re.findall(r"\b[A-Z][a-zA-Z]{2,}\b", text):
+            if token.lower() not in Session._WM_ANCHOR_STOPWORDS:
+                anchors.add(token.lower())
+        return anchors
+
+    @staticmethod
+    def _salvage_new_items_from_rejected_update(
+        new_content: str, old_content: str
+    ) -> Dict[str, Any]:
+        """When a consolidation UPDATE is rejected, salvage genuinely new
+        items from the update content and APPEND them so we don't lose
+        facts from the current round."""
+        new_items = Session._wm_extract_bullet_items(new_content)
+        old_lower = (old_content or "").lower()
+        fresh_items = []
+        for it in new_items:
+            key = it.strip("_* `").lower()
+            if key and key not in old_lower:
+                fresh_items.append(it)
+        if fresh_items:
+            _wm_debug(
+                f"guard: salvaged {len(fresh_items)} new items from rejected UPDATE"
+            )
+            return {"op": "APPEND", "items": fresh_items}
+        return {"op": "KEEP"}
+
+    @staticmethod
+    def _wm_enforce_key_facts_consolidation(
+        op: Any, old_content: str
+    ) -> Dict[str, Any]:
+        """Guard: allow controlled consolidation for Key Facts & Decisions.
+
+        Layer 1 — reject trivially small UPDATEs (< 15% bullet count).
+        Layer 2 — require >= 70% lexical anchor coverage.
+        Rejection salvages genuinely new items from the rejected UPDATE
+        via APPEND, so current-round facts are not silently lost.
+        """
+        if not isinstance(op, dict):
+            return {"op": "KEEP"}
+        op_name = (op.get("op") or "").upper()
+        if op_name in ("KEEP", "APPEND"):
+            return op
+        if op_name != "UPDATE":
+            return {"op": "KEEP"}
+
+        new_content = (op.get("content") or "").strip()
+        old_items = Session._wm_extract_bullet_items(old_content or "")
+        new_items = Session._wm_extract_bullet_items(new_content)
+
+        if not old_items:
+            return op
+
+        # Layer 1: reject trivially small consolidation
+        ratio = len(new_items) / len(old_items) if old_items else 1.0
+        if ratio < Session._WM_KEY_FACTS_MIN_BULLET_RATIO:
+            _wm_debug(
+                f"guard: Key Facts consolidation REJECTED (layer1): "
+                f"new={len(new_items)} / old={len(old_items)} = "
+                f"{ratio:.2%} < {Session._WM_KEY_FACTS_MIN_BULLET_RATIO:.0%}"
+            )
+            return Session._salvage_new_items_from_rejected_update(
+                new_content, old_content
+            )
+
+        # Layer 2: lexical anchor coverage
+        old_anchors = Session._extract_lexical_anchors(old_content or "")
+        if old_anchors:
+            new_anchors = Session._extract_lexical_anchors(new_content)
+            covered = len(old_anchors & new_anchors)
+            coverage = covered / len(old_anchors)
+            if coverage < Session._WM_KEY_FACTS_MIN_ANCHOR_COVERAGE:
+                _wm_debug(
+                    f"guard: Key Facts consolidation REJECTED (layer2): "
+                    f"anchor coverage={coverage:.2%} "
+                    f"({covered}/{len(old_anchors)}) < "
+                    f"{Session._WM_KEY_FACTS_MIN_ANCHOR_COVERAGE:.0%}"
+                )
+                return Session._salvage_new_items_from_rejected_update(
+                    new_content, old_content
+                )
+            _wm_debug(
+                f"guard: Key Facts consolidation ACCEPTED: "
+                f"bullets {len(old_items)}->{len(new_items)} "
+                f"({ratio:.1%}), "
+                f"anchors={coverage:.1%} ({covered}/{len(old_anchors)})"
+            )
+        else:
+            _wm_debug(
+                f"guard: Key Facts consolidation ACCEPTED (no old anchors): "
+                f"bullets {len(old_items)}->{len(new_items)}"
+            )
+
+        return op
 
     @staticmethod
     def _wm_enforce_files_no_regression(op: Any, old_content: str) -> Dict[str, Any]:
@@ -1971,8 +2152,12 @@ class Session:
 
         Per-section server-side guards run BEFORE the op is applied:
 
-        - ``Errors & Corrections`` and ``Key Facts & Decisions`` are
-          append-only; UPDATE is demoted to APPEND of only-new items.
+        - ``Errors & Corrections`` is append-only; UPDATE is demoted to
+          APPEND of only-new items.
+        - ``Key Facts & Decisions`` uses a fact-preserving dual-threshold
+          guard: UPDATE is accepted only if the consolidated content has
+          >= 15% of old bullet count AND >= 70% lexical anchor coverage.
+          Rejected UPDATEs fall back to KEEP (not APPEND).
         - ``Files & Context`` UPDATE that loses old file paths is rejected
           (KEEP + APPEND newly-added paths instead).
         - ``Session Title`` UPDATE with zero meaningful-word overlap against
@@ -2000,6 +2185,8 @@ class Session:
             if old_content:
                 if header == "Session Title":
                     op = Session._wm_enforce_title_stability(op, old_content)
+                elif header == "Key Facts & Decisions":
+                    op = Session._wm_enforce_key_facts_consolidation(op, old_content)
                 elif header in Session._WM_APPEND_ONLY_SECTIONS:
                     op = Session._wm_enforce_append_only(header, op, old_content)
                 elif header == "Files & Context":
