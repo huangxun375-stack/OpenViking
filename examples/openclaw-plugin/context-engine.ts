@@ -10,6 +10,7 @@ import {
 import {
   compileSessionPatterns,
   getCaptureDecision,
+  type ExtractedMessage,
   extractNewTurnMessages,
   shouldBypassSession,
 } from "./text-utils.js";
@@ -56,6 +57,22 @@ export function toRoleId(senderId: string | undefined): string | undefined {
 
 type IngestBatchResult = {
   ingestedCount: number;
+};
+
+type CapturedMessagePart = {
+  type: "text" | "tool";
+  text?: string;
+  tool_id?: string;
+  tool_name?: string;
+  tool_input?: unknown;
+  tool_output?: string;
+  tool_status?: string;
+};
+
+export type CapturedOpenVikingMessage = {
+  msg: ExtractedMessage;
+  ovParts: CapturedMessagePart[];
+  signature: string;
 };
 
 type CompactResult = {
@@ -219,6 +236,302 @@ function messageDigest(messages: AgentMessage[], maxCharsPerMsg = 2000): Array<{
       truncated,
     };
   });
+}
+
+function isEmptyPlainObject(value: unknown): boolean {
+  return Object.prototype.toString.call(value) === "[object Object]" &&
+    Object.keys(value as Record<string, unknown>).length === 0;
+}
+
+function normalizeMessageParts(parts: Array<CapturedMessagePart | OVMessage["parts"][number]>): CapturedMessagePart[] {
+  return parts.map((part) => {
+    if (part.type === "text") {
+      return {
+        type: "text",
+        text: typeof part.text === "string" ? part.text : "",
+      };
+    }
+    return {
+      type: "tool",
+      tool_id: typeof part.tool_id === "string" ? part.tool_id : "",
+      tool_name: typeof part.tool_name === "string" ? part.tool_name : "",
+      tool_input: isEmptyPlainObject(part.tool_input) ? undefined : part.tool_input,
+      tool_output: typeof part.tool_output === "string" ? part.tool_output : "",
+      tool_status: typeof part.tool_status === "string" ? part.tool_status : "",
+    };
+  });
+}
+
+export function capturedMessageSignature(params: {
+  role: ExtractedMessage["role"] | string;
+  parts: Array<CapturedMessagePart | OVMessage["parts"][number]>;
+}): string {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      role: params.role,
+      parts: normalizeMessageParts(params.parts),
+    }))
+    .digest("hex");
+}
+
+export type AfterTurnDedupMatchKind =
+  | "none"
+  | "no-op"
+  | "tail-match"
+  | "full-prefix"
+  | "suffix-fallback";
+
+export type AfterTurnDedupResult = {
+  /** Messages that should be appended to OV (tail of incoming with replay prefix removed). */
+  toAppend: CapturedOpenVikingMessage[];
+  /** Number of incoming messages classified as already-stored replay and skipped. */
+  skipped: number;
+  /** Which dedup branch produced the result; useful for diagnostics. */
+  matchKind: AfterTurnDedupMatchKind;
+  /** Optional human-readable rationale (especially for fallback branches). */
+  reason?: string;
+};
+
+/**
+ * AfterTurn replay-aware deduplication for OpenViking.
+ *
+ * The OpenClaw 2026.4.x ``installContextEngineLoopHook`` advances a
+ * private ``lastSeenLength`` per loop iteration, but the attempt
+ * finalizer (``finalizeHarnessContextEngineTurn``) reuses the outer
+ * ``prePromptMessageCount`` and re-emits the entire turn delta. Without
+ * a plugin-side guard, every finalizer replays the whole turn into OV
+ * once more, producing duplicates.
+ *
+ * The algorithm splits across three helpers —
+ * ``deduplicateAfterTurnBatch`` (entry point dispatching by length),
+ * ``deduplicateOversizedBatch`` (stored history longer than the batch)
+ * and ``deduplicateSuffixFallback`` (tail-walk). The matching is
+ * ordering-aware:
+ * - It never deduplicates an isolated message based on content alone;
+ *   any positive match requires the incoming batch to align with a
+ *   contiguous segment of stored messages.
+ * - It also refuses to use a one-message stored prefix as positive
+ *   proof. That case is ambiguous: it may be a finalizer replay of a
+ *   just-captured hook message, or it may be a real next turn whose
+ *   first user message has identical content. We prefer a possible
+ *   duplicate over dropping a real user message.
+ * - It never lets content-only matching consume the entire incoming
+ *   batch. A full-batch match may be a true replay, but it may also be
+ *   a legitimate next turn with identical user/assistant text. Without
+ *   a runtime message id or turn kind, preserving input is safer.
+ */
+export function deduplicateAfterTurnBatch(
+  storedTail: OVMessage[],
+  incoming: CapturedOpenVikingMessage[],
+  options?: { oversizedNoOverlap?: "ingest" | "skip" },
+): AfterTurnDedupResult {
+  if (incoming.length === 0) {
+    return { toAppend: incoming, skipped: 0, matchKind: "no-op" };
+  }
+  if (incoming.length === 1) {
+    return {
+      toAppend: incoming,
+      skipped: 0,
+      matchKind: "none",
+      reason: "single-message-no-dedup",
+    };
+  }
+  if (storedTail.length === 0) {
+    return { toAppend: incoming, skipped: 0, matchKind: "none" };
+  }
+
+  const storedSignatures = storedTail.map((message) =>
+    capturedMessageSignature({ role: message.role, parts: message.parts }),
+  );
+  const incomingSignatures = incoming.map((message) => message.signature);
+
+  if (storedTail.length > incoming.length) {
+    return deduplicateOversizedBatch(
+      storedSignatures,
+      incoming,
+      incomingSignatures,
+      options,
+    );
+  }
+
+  // storedTail.length <= incoming.length: batch may be a finalizer-style
+  // replay where the entire stored history is the prefix of the incoming
+  // batch. Verify the boundary identity first (cheap reject) before doing
+  // the full prefix scan.
+  const boundaryStored = storedSignatures[storedSignatures.length - 1];
+  const boundaryIncoming = incomingSignatures[storedSignatures.length - 1];
+  if (boundaryStored !== boundaryIncoming) {
+    return deduplicateSuffixFallback(
+      storedSignatures,
+      incoming,
+      incomingSignatures,
+      "prefix-mismatch",
+    );
+  }
+
+  if (storedSignatures.length === 1) {
+    return {
+      toAppend: incoming,
+      skipped: 0,
+      matchKind: "none",
+      reason: "single-stored-prefix-no-dedup",
+    };
+  }
+
+  for (let i = 0; i < storedSignatures.length; i += 1) {
+    if (storedSignatures[i] !== incomingSignatures[i]) {
+      return deduplicateSuffixFallback(
+        storedSignatures,
+        incoming,
+        incomingSignatures,
+        "full-prefix-mismatch",
+      );
+    }
+  }
+
+  const toAppend = incoming.slice(storedSignatures.length);
+  if (toAppend.length === 0) {
+    return {
+      toAppend: incoming,
+      skipped: 0,
+      matchKind: "none",
+      reason: "full-prefix-empty-no-dedup",
+    };
+  }
+
+  return {
+    toAppend,
+    skipped: storedSignatures.length,
+    matchKind: "full-prefix",
+  };
+}
+
+/**
+ * Stored history is longer than the incoming batch — likely a tail-only
+ * replay observed after the runtime has already commited to a deeper
+ * transcript than the plugin sees in this afterTurn call.
+ *
+ * 1. If stored.last == incoming.last, verify whether the **entire**
+ *    incoming batch matches the stored tail of the same length. That is
+ *    not enough proof to skip the batch, because a legitimate next turn
+ *    can contain identical content; keep the incoming batch instead.
+ * 2. Otherwise fall through to suffix matching, optionally fail-closed
+ *    when no overlap exists at all. We default to ``ingest`` (see the
+ *    no-overlap branch below): OpenViking has no transcript reconcile
+ *    path, and silently dropping legitimately new messages is strictly
+ *    worse than tolerating an occasional duplicate on a true tail-only
+ *    replay.
+ */
+function deduplicateOversizedBatch(
+  storedSignatures: string[],
+  incoming: CapturedOpenVikingMessage[],
+  incomingSignatures: string[],
+  options?: { oversizedNoOverlap?: "ingest" | "skip" },
+): AfterTurnDedupResult {
+  const lastStored = storedSignatures[storedSignatures.length - 1];
+  const lastIncoming = incomingSignatures[incomingSignatures.length - 1];
+
+  if (lastStored === lastIncoming) {
+    const tailStart = storedSignatures.length - incoming.length;
+    let tailMatches = true;
+    for (let i = 0; i < incoming.length; i += 1) {
+      if (storedSignatures[tailStart + i] !== incomingSignatures[i]) {
+        tailMatches = false;
+        break;
+      }
+    }
+    if (tailMatches) {
+      return {
+        toAppend: incoming,
+        skipped: 0,
+        matchKind: "none",
+        reason: "tail-match-empty-no-dedup",
+      };
+    }
+  }
+
+  // Default to "ingest" on no-overlap, never "skip". Failing closed
+  // would require an external transcript reconcile path that imports
+  // genuine missing JSONL tail turns before afterTurn dedup runs;
+  // OpenViking has no equivalent reconcile mechanism — the plugin's
+  // afterTurn is the only ingest path — so fail-closed would permanently
+  // drop legitimately new messages whose content happens to match
+  // nothing in the existing stored tail (for example, a single new user
+  // message after the previous turn already grew the stored tail beyond
+  // the incoming batch length). Tolerating an occasional duplicated
+  // entry on a true tail-only replay is strictly safer than silently
+  // losing a real user turn.
+  return deduplicateSuffixFallback(
+    storedSignatures,
+    incoming,
+    incomingSignatures,
+    "oversized",
+    { onNoOverlap: options?.oversizedNoOverlap ?? "ingest" },
+  );
+}
+
+/**
+ * Suffix-matching fallback: scan the incoming batch from the end looking
+ * for an index ``k`` where ``incoming[..k]`` aligns with the trailing
+ * end of stored history. Return only the messages strictly after ``k``.
+ *
+ * The matching constraint is order-preserving and only accepts matches
+ * that leave a non-empty new tail. If the overlap would consume the
+ * entire incoming batch, content alone cannot prove this is a replay
+ * rather than a real repeated turn.
+ */
+function deduplicateSuffixFallback(
+  storedSignatures: string[],
+  incoming: CapturedOpenVikingMessage[],
+  incomingSignatures: string[],
+  context: string,
+  options?: { onNoOverlap?: "ingest" | "skip" },
+): AfterTurnDedupResult {
+  if (storedSignatures.length === 0) {
+    return { toAppend: incoming, skipped: 0, matchKind: "none", reason: context };
+  }
+  const lastStored = storedSignatures[storedSignatures.length - 1];
+
+  for (let k = incomingSignatures.length - 1; k >= 0; k -= 1) {
+    if (incomingSignatures[k] !== lastStored) {
+      continue;
+    }
+    const matchLen = Math.min(k + 1, storedSignatures.length);
+    const startStored = storedSignatures.length - matchLen;
+    let suffixMatch = true;
+    for (let j = 0; j < matchLen; j += 1) {
+      if (
+        storedSignatures[startStored + j] !== incomingSignatures[k - matchLen + 1 + j]
+      ) {
+        suffixMatch = false;
+        break;
+      }
+    }
+    const newSlice = incoming.slice(k + 1);
+    if (suffixMatch && newSlice.length > 0) {
+      return {
+        toAppend: newSlice,
+        skipped: incoming.length - newSlice.length,
+        matchKind: "suffix-fallback",
+        reason: context,
+      };
+    }
+  }
+
+  if (options?.onNoOverlap === "skip") {
+    return {
+      toAppend: [],
+      skipped: incoming.length,
+      matchKind: "suffix-fallback",
+      reason: `${context}-no-overlap-fail-closed`,
+    };
+  }
+  return {
+    toAppend: incoming,
+    skipped: 0,
+    matchKind: "none",
+    reason: `${context}-no-overlap-ingest`,
+  };
 }
 
 function extractAgentMessageText(message: AgentMessage | undefined): string {
@@ -1300,21 +1613,11 @@ export function createMemoryOpenVikingContextEngine(params: {
         const newMsgFull = messageDigest(newMessages);
         const newTurnTokens = newMsgFull.reduce((s, d) => s + d.tokens, 0);
 
-        diag("afterTurn_entry", OVSessionId, {
-          totalMessages: messages.length,
-          newMessageCount: newCount,
-          prePromptMessageCount: start,
-          newTurnTokens,
-          senderIdFound: sender.found,
-          senderId: sender.senderId ?? null,
-          messages: newMsgFull,
-        });
-
         const client = await getClient();
         const createdAt = pickLatestCreatedAt(turnMessages);
         const senderRoleId = toRoleId(sender.senderId);
         // 发送结构化消息：统一 role 为 user，通过 parts 区分类型
-        for (const msg of extractedMessages) {
+        const capturedMessages: CapturedOpenVikingMessage[] = extractedMessages.map((msg) => {
           const ovParts = msg.parts.map((part) => {
             if (part.type === "text") {
               // 清理 relevant-memories 块
@@ -1334,7 +1637,100 @@ export function createMemoryOpenVikingContextEngine(params: {
               };
             }
           });
+          return {
+            msg,
+            ovParts,
+            signature: capturedMessageSignature({ role: msg.role, parts: ovParts }),
+          };
+        });
 
+        // Pre-fetch session meta so we can pull the live-only stored tail
+        // (capped at ``message_count`` — never crossing into archives, which
+        // would compare against summarized history that the runtime no
+        // longer puts into incoming) and get pending_tokens in one round
+        // trip. The returned shape is reused for the post-write commit
+        // decision below.
+        let preSessionInfo: Awaited<ReturnType<typeof client.getSession>> | undefined;
+        try {
+          preSessionInfo = await client.getSession(OVSessionId, agentId);
+        } catch (sessErr) {
+          logger.warn?.(
+            `openviking: afterTurn pre-fetch session meta failed for session=${OVSessionId}: ${String(sessErr)}`,
+          );
+          diag("afterTurn_pre_session_fetch_error", OVSessionId, {
+            error: String(sessErr),
+            senderIdFound: sender.found,
+            senderId: sender.senderId ?? null,
+          });
+        }
+        const liveMessageCount = Math.max(0, Math.floor(preSessionInfo?.message_count ?? 0));
+
+        let messagesToAppend = capturedMessages;
+        let dedupMatchKind: AfterTurnDedupMatchKind = "no-op";
+        let dedupSkipped = 0;
+        let dedupReason: string | undefined;
+        let persistedTailLength = 0;
+        let dedupTailLimit = 0;
+        if (capturedMessages.length > 0 && liveMessageCount > 0) {
+          dedupTailLimit = Math.min(10_000, liveMessageCount);
+          try {
+            const persistedTail = await client.getSessionMessagesTail(
+              OVSessionId,
+              dedupTailLimit,
+              agentId,
+            );
+            const persistedMessages = Array.isArray(persistedTail.messages)
+              ? persistedTail.messages
+              : [];
+            persistedTailLength = persistedMessages.length;
+            const result = deduplicateAfterTurnBatch(persistedMessages, capturedMessages);
+            messagesToAppend = result.toAppend;
+            dedupMatchKind = result.matchKind;
+            dedupSkipped = result.skipped;
+            dedupReason = result.reason;
+            if (dedupSkipped > 0) {
+              diag("afterTurn_tail_dedup", OVSessionId, {
+                skippedMessages: dedupSkipped,
+                capturedMessages: capturedMessages.length,
+                persistedTailMessages: persistedMessages.length,
+                tailLimit: dedupTailLimit,
+                liveMessageCount,
+                matchKind: dedupMatchKind,
+                reason: dedupReason ?? null,
+                senderIdFound: sender.found,
+                senderId: sender.senderId ?? null,
+              });
+            }
+          } catch (tailErr) {
+            logger.warn?.(
+              `openviking: afterTurn raw tail fetch failed for session=${OVSessionId}: ${String(tailErr)}`,
+            );
+            diag("afterTurn_tail_dedup_error", OVSessionId, {
+              error: String(tailErr),
+              capturedMessages: capturedMessages.length,
+              senderIdFound: sender.found,
+              senderId: sender.senderId ?? null,
+            });
+          }
+        }
+
+        diag("afterTurn_entry", OVSessionId, {
+          totalMessages: messages.length,
+          newMessageCount: newCount,
+          prePromptMessageCount: start,
+          liveMessageCount,
+          persistedTailLength,
+          dedupTailLimit,
+          dedupMatchKind,
+          dedupSkipped,
+          dedupReason: dedupReason ?? null,
+          newTurnTokens,
+          senderIdFound: sender.found,
+          senderId: sender.senderId ?? null,
+          messages: newMsgFull,
+        });
+
+        for (const { msg, ovParts } of messagesToAppend) {
           if (ovParts.length > 0) {
             await client.addSessionMessage(
               OVSessionId,
@@ -1347,8 +1743,13 @@ export function createMemoryOpenVikingContextEngine(params: {
           }
         }
 
-        const session = await client.getSession(OVSessionId, agentId);
-        const pendingTokens = session.pending_tokens ?? 0;
+        // Re-fetch pending_tokens now that this batch's writes are
+        // persisted; the pre-fetch above only captured the state before
+        // this turn's appends.
+        const session = messagesToAppend.length > 0
+          ? await client.getSession(OVSessionId, agentId)
+          : preSessionInfo;
+        const pendingTokens = session?.pending_tokens ?? 0;
 
         if (pendingTokens < cfg.commitTokenThreshold) {
           diag("afterTurn_skip", OVSessionId, {
