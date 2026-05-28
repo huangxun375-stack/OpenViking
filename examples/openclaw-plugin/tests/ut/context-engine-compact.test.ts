@@ -7,6 +7,8 @@ import {
   openClawSessionToOvStorageId,
 } from "../../context-engine.js";
 
+type TestSessionContext = Awaited<ReturnType<OpenVikingClient["getSessionContext"]>>;
+
 function makeLogger() {
   return {
     info: vi.fn(),
@@ -15,12 +17,17 @@ function makeLogger() {
   };
 }
 
-function makeEngine(commitResult: unknown, opts?: { throwError?: Error }) {
+function makeEngine(commitResult: unknown, opts?: {
+  throwError?: Error;
+  sessionContext?: TestSessionContext;
+  configOverrides?: Record<string, unknown>;
+}) {
   const cfg = memoryOpenVikingConfigSchema.parse({
     mode: "remote",
     baseUrl: "http://127.0.0.1:1933",
     autoCapture: false,
     autoRecall: false,
+    ...(opts?.configOverrides ?? {}),
   });
   const logger = makeLogger();
 
@@ -30,7 +37,7 @@ function makeEngine(commitResult: unknown, opts?: { throwError?: Error }) {
 
   const client = {
     commitSession,
-    getSessionContext: vi.fn().mockResolvedValue({
+    getSessionContext: vi.fn().mockResolvedValue(opts?.sessionContext ?? {
       latest_archive_overview: "",
       latest_archive_id: "",
       pre_archive_abstracts: [],
@@ -57,9 +64,22 @@ function makeEngine(commitResult: unknown, opts?: { throwError?: Error }) {
     engine,
     client: client as unknown as {
       commitSession: ReturnType<typeof vi.fn>;
+      getSessionContext: ReturnType<typeof vi.fn>;
     },
     logger,
     resolveAgentId,
+  };
+}
+
+function interceptRequest(overrides?: Record<string, unknown>) {
+  return {
+    sessionId: "s-intercept",
+    sessionFile: "session.jsonl",
+    tokenBudget: 4096,
+    currentTokenCount: 3900,
+    firstKeptEntryId: "pi-entry-42",
+    tokensBefore: 3900,
+    ...(overrides ?? {}),
   };
 }
 
@@ -446,5 +466,195 @@ describe("context-engine compact()", () => {
     expect(logger.warn).not.toHaveBeenCalledWith(
       expect.stringContaining("compact commit failed"),
     );
+  });
+});
+
+describe("context-engine interceptCompaction()", () => {
+  it("advertises compaction interception and keeps recent messages when handling Pi compaction", async () => {
+    const { engine, client } = makeEngine({
+      status: "completed",
+      archived: true,
+      archive_uri: "ov://archive/archive-1",
+      task_id: "task-intercept",
+      memories_extracted: { core: 1 },
+    }, {
+      sessionContext: {
+        latest_archive_overview: "The user is validating compaction intercept.",
+        latest_archive_id: "archive-1",
+        pre_archive_abstracts: [],
+        messages: [{
+          id: "live-1",
+          role: "user",
+          parts: [{ type: "text", text: "Please keep this recent tail live." }],
+          created_at: "2026-05-28T10:00:00.000Z",
+        }],
+        estimatedTokens: 321,
+        stats: { totalArchives: 1, includedArchives: 1, droppedArchives: 0, failedArchives: 0, activeTokens: 120, archiveTokens: 201 },
+      },
+    });
+
+    expect((engine.info as any).interceptsCompaction).toBe(true);
+
+    const result = await (engine as any).interceptCompaction({
+      sessionId: "s-intercept",
+      sessionFile: "session.jsonl",
+      tokenBudget: 4096,
+      currentTokenCount: 3900,
+      firstKeptEntryId: "pi-entry-42",
+      tokensBefore: 3900,
+    });
+
+    expect(client.commitSession).toHaveBeenCalledTimes(1);
+    expect(client.commitSession.mock.calls[0][1]).toMatchObject({
+      wait: true,
+      keepRecentCount: 10,
+    });
+    expect(result).toMatchObject({
+      handled: true,
+      firstKeptEntryId: "pi-entry-42",
+      tokensBefore: 3900,
+    });
+    expect(result.tokensAfter).toBeGreaterThan(0);
+    expect(result.summary).toContain("The user is validating compaction intercept.");
+    expect(result.summary).toContain("Please keep this recent tail live.");
+  });
+
+  it("declines before touching OV when the compaction signal is already aborted", async () => {
+    const { engine, client } = makeEngine({
+      status: "completed",
+      archived: true,
+      memories_extracted: {},
+    });
+
+    const result = await (engine as any).interceptCompaction(interceptRequest({
+      signal: { aborted: true },
+    }));
+
+    expect(result).toEqual({
+      handled: false,
+      reason: "aborted-pre-compaction",
+    });
+    expect(client.commitSession).not.toHaveBeenCalled();
+    expect(client.getSessionContext).not.toHaveBeenCalled();
+  });
+
+  it("declines bypassed sessions without committing", async () => {
+    const { engine, client } = makeEngine({
+      status: "completed",
+      archived: true,
+      memories_extracted: {},
+    }, {
+      configOverrides: {
+        bypassSessionPatterns: ["agent:*:cron:**"],
+      },
+    });
+
+    const result = await (engine as any).interceptCompaction(interceptRequest({
+      sessionId: "runtime-session",
+      sessionKey: "agent:main:cron:nightly:run:1",
+    }));
+
+    expect(result).toEqual({
+      handled: false,
+      reason: "session-bypassed",
+    });
+    expect(client.commitSession).not.toHaveBeenCalled();
+  });
+
+  it("falls back with a compact-failed reason when OV commit fails", async () => {
+    const { engine } = makeEngine({
+      status: "failed",
+      error: "extractor failed",
+      task_id: "task-failed",
+      archived: false,
+    });
+
+    const result = await (engine as any).interceptCompaction(interceptRequest());
+
+    expect(result).toEqual({
+      handled: false,
+      reason: "compact-failed:commit_failed",
+    });
+  });
+
+  it("falls back when compact produces no archive instead of returning an empty summary", async () => {
+    const { engine } = makeEngine({
+      status: "completed",
+      archived: false,
+      task_id: "task-no-archive",
+      memories_extracted: {},
+    });
+
+    const result = await (engine as any).interceptCompaction(interceptRequest());
+
+    expect(result).toEqual({
+      handled: false,
+      reason: "compact-failed:commit_no_archive",
+    });
+  });
+
+  it("falls back when post-compaction assemble produces no context", async () => {
+    const { engine } = makeEngine({
+      status: "completed",
+      archived: true,
+      archive_uri: "ov://archive/archive-empty",
+      memories_extracted: {},
+    });
+
+    const result = await (engine as any).interceptCompaction(interceptRequest());
+
+    expect(result).toEqual({
+      handled: false,
+      reason: "openviking-produced-no-context",
+    });
+  });
+
+  it("serializes OV assembled context as lossless-style role blocks and preserves Pi boundaries", async () => {
+    const { engine } = makeEngine({
+      status: "completed",
+      archived: true,
+      archive_uri: "ov://archive/ov-archive-99",
+      memories_extracted: { core: 2 },
+    }, {
+      sessionContext: {
+        latest_archive_overview: "<summary id=\"ov-1\" kind=\"leaf\">Archived facts</summary>",
+        latest_archive_id: "ov-archive-99",
+        pre_archive_abstracts: [],
+        messages: [{
+          id: "assistant-tool",
+          role: "assistant",
+          parts: [
+            { type: "text", text: "I will inspect the file." },
+            {
+              type: "tool",
+              tool_id: "toolu_123",
+              tool_name: "read_file",
+              tool_input: { path: "README.md" },
+              tool_output: "README contents",
+              tool_status: "completed",
+            },
+          ],
+          created_at: "2026-05-28T10:00:00.000Z",
+        }],
+        estimatedTokens: 456,
+        stats: { totalArchives: 1, includedArchives: 1, droppedArchives: 0, failedArchives: 0, activeTokens: 200, archiveTokens: 256 },
+      },
+    });
+
+    const result = await (engine as any).interceptCompaction(interceptRequest({
+      firstKeptEntryId: "pi-kept-entry",
+      tokensBefore: 7777,
+    }));
+
+    expect(result).toMatchObject({
+      handled: true,
+      firstKeptEntryId: "pi-kept-entry",
+      tokensBefore: 7777,
+    });
+    expect(result.details.openvikingFirstKeptEntryId).toBe("ov-archive-99");
+    expect(result.summary).toContain("[user]\n[Session History Summary]\n<summary id=\"ov-1\"");
+    expect(result.summary).toContain("[assistant]\nI will inspect the file.");
+    expect(result.summary).toContain("[toolCall: read_file {\"path\":\"README.md\"}]");
+    expect(result.summary).toContain("[toolResult]\nREADME contents");
   });
 });

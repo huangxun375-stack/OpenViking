@@ -32,6 +32,7 @@ type ContextEngineInfo = {
   name: string;
   version?: string;
   ownsCompaction: true;
+  interceptsCompaction?: true;
 };
 
 type AssembleResult = {
@@ -73,6 +74,32 @@ type CompactResult = {
   };
 };
 
+type CompactionInterceptRequest = {
+  sessionId: string;
+  sessionKey?: string;
+  sessionFile: string;
+  tokenBudget?: number;
+  currentTokenCount?: number;
+  firstKeptEntryId: string;
+  tokensBefore: number;
+  trigger?: string;
+  signal?: { aborted?: boolean };
+};
+
+type CompactionInterceptResult =
+  | {
+      handled: true;
+      summary: string;
+      firstKeptEntryId: string;
+      tokensBefore: number;
+      tokensAfter?: number;
+      details?: unknown;
+    }
+  | {
+      handled: false;
+      reason?: string;
+    };
+
 type ContextEngine = {
   info: ContextEngineInfo;
   ingest: (params: { sessionId: string; message: AgentMessage; isHeartbeat?: boolean }) => Promise<IngestResult>;
@@ -111,6 +138,7 @@ type ContextEngine = {
     customInstructions?: string;
     runtimeContext?: Record<string, unknown>;
   }) => Promise<CompactResult>;
+  interceptCompaction?: (request: CompactionInterceptRequest) => Promise<CompactionInterceptResult>;
 };
 
 export type ContextEngineWithCommit = ContextEngine & {
@@ -243,6 +271,54 @@ function extractAgentMessageText(message: AgentMessage | undefined): string {
       .join("\n");
   }
   return "";
+}
+
+function serializeAgentMessageContent(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((block) => {
+        if (!block || typeof block !== "object") {
+          return "";
+        }
+        const b = block as Record<string, unknown>;
+        if (b.type === "text" && typeof b.text === "string") {
+          return b.text;
+        }
+        if (b.type === "toolCall") {
+          return `[toolCall: ${String(b.name ?? "unknown")} ${JSON.stringify(b.arguments ?? {})}]`;
+        }
+        if (b.type === "toolResult") {
+          return `[toolResult: ${JSON.stringify(b.content ?? "")}]`;
+        }
+        return `[${String(b.type ?? "content")}]: ${JSON.stringify(b)}`;
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (content == null) {
+    return "";
+  }
+  return JSON.stringify(content);
+}
+
+function serializeAssembledContextForCompaction(result: AssembleResult): string {
+  const sections: string[] = [];
+  if (result.systemPromptAddition?.trim()) {
+    sections.push(`[OpenViking Context Guide]\n${result.systemPromptAddition.trim()}`);
+  }
+  for (const message of result.messages) {
+    const role = typeof message.role === "string" && message.role.trim()
+      ? message.role.trim()
+      : "unknown";
+    const text = serializeAgentMessageContent(message.content).trim();
+    if (text) {
+      sections.push(`[${role}]\n${text}`);
+    }
+  }
+  return sections.join("\n\n").trim();
 }
 
 function hasAutoRecallBlock(message: AgentMessage | undefined): boolean {
@@ -1068,12 +1144,17 @@ export function createMemoryOpenVikingContextEngine(params: {
     return { sanitized, archive, session, budgets, instruction };
   }
 
-  return {
+  function compactKeepRecentCount(): number {
+    return Math.max(1, Math.floor(cfg.commitKeepRecentCount ?? 1));
+  }
+
+  const engine: ContextEngineWithCommit = {
     info: {
       id,
       name,
       version,
       ownsCompaction: true,
+      interceptsCompaction: true,
     },
 
     commitOVSession: doCommitOVSession,
@@ -1445,14 +1526,107 @@ export function createMemoryOpenVikingContextEngine(params: {
       }
     },
 
+    async interceptCompaction(request): Promise<CompactionInterceptResult> {
+      const { sessionKey, ovSessionId: OVSessionId } = resolveSessionIdentity(request);
+      const tokenBudget = validTokenBudget(request.tokenBudget) ?? 128_000;
+      diag("intercept_compaction_entry", OVSessionId, {
+        tokenBudget,
+        currentTokenCount: request.currentTokenCount ?? null,
+        tokensBefore: request.tokensBefore,
+        firstKeptEntryId: request.firstKeptEntryId,
+        trigger: request.trigger ?? null,
+        sessionKey: sessionKey ?? null,
+      });
+
+      if (request.signal?.aborted) {
+        return { handled: false, reason: "aborted-pre-compaction" };
+      }
+      if (isBypassedSession({ sessionId: request.sessionId, sessionKey })) {
+        diag("intercept_compaction_result", OVSessionId, {
+          handled: false,
+          reason: "session-bypassed",
+        });
+        return { handled: false, reason: "session-bypassed" };
+      }
+
+      try {
+        const compactResult = await engine.compact({
+          sessionId: request.sessionId,
+          sessionKey: request.sessionKey,
+          sessionFile: request.sessionFile,
+          tokenBudget,
+          currentTokenCount: request.currentTokenCount,
+          compactionTarget: "budget",
+          force: true,
+        });
+
+        if (!compactResult.ok || !compactResult.compacted) {
+          const reason = `compact-failed:${compactResult.reason ?? "unknown"}`;
+          diag("intercept_compaction_result", OVSessionId, {
+            handled: false,
+            reason,
+            compactOk: compactResult.ok,
+            compacted: compactResult.compacted,
+          });
+          return { handled: false, reason };
+        }
+
+        if (request.signal?.aborted) {
+          return { handled: false, reason: "aborted-mid-compaction" };
+        }
+
+        const assembled = await engine.assemble({
+          sessionId: request.sessionId,
+          sessionKey: request.sessionKey,
+          messages: [],
+          prompt: "",
+          tokenBudget,
+        });
+        const summary = serializeAssembledContextForCompaction(assembled);
+        if (!summary) {
+          diag("intercept_compaction_result", OVSessionId, {
+            handled: false,
+            reason: "openviking-produced-no-context",
+            estimatedTokens: assembled.estimatedTokens,
+          });
+          return { handled: false, reason: "openviking-produced-no-context" };
+        }
+
+        diag("intercept_compaction_result", OVSessionId, {
+          handled: true,
+          tokensBefore: request.tokensBefore,
+          tokensAfter: assembled.estimatedTokens,
+          summaryChars: summary.length,
+        });
+        return {
+          handled: true,
+          summary,
+          firstKeptEntryId: request.firstKeptEntryId,
+          tokensBefore: request.tokensBefore,
+          tokensAfter: assembled.estimatedTokens,
+          details: {
+            compact: compactResult,
+            openvikingFirstKeptEntryId: compactResult.result?.firstKeptEntryId,
+          },
+        };
+      } catch (err) {
+        const error = String(err);
+        logger.warn?.(`openviking: interceptCompaction failed for session=${OVSessionId}: ${error}`);
+        diag("intercept_compaction_error", OVSessionId, { error });
+        return { handled: false, reason: "intercept_error" };
+      }
+    },
+
     async compact(compactParams): Promise<CompactResult> {
       const { sessionKey, ovSessionId: OVSessionId } = resolveSessionIdentity(compactParams);
       const tokenBudget = validTokenBudget(compactParams.tokenBudget) ?? 128_000;
+      const keepRecentCount = compactKeepRecentCount();
       diag("compact_entry", OVSessionId, {
         tokenBudget,
         force: compactParams.force ?? false,
         currentTokenCount: compactParams.currentTokenCount ?? null,
         compactionTarget: compactParams.compactionTarget ?? null,
+        keepRecentCount,
         hasCustomInstructions: typeof compactParams.customInstructions === "string" &&
           compactParams.customInstructions.trim().length > 0,
       });
@@ -1495,12 +1669,13 @@ export function createMemoryOpenVikingContextEngine(params: {
 
       try {
         logger.info(
-          `openviking: compact committing session=${OVSessionId} (wait=true, tokenBudget=${tokenBudget})`,
+          `openviking: compact committing session=${OVSessionId} ` +
+            `(wait=true, tokenBudget=${tokenBudget}, keepRecentCount=${keepRecentCount})`,
         );
         const commitResult = await client.commitSession(OVSessionId, {
           wait: true,
           agentId,
-          keepRecentCount: 0,
+          keepRecentCount,
         });
         const memCount = totalExtractedMemories(commitResult.memories_extracted);
 
@@ -1734,4 +1909,6 @@ export function createMemoryOpenVikingContextEngine(params: {
       }
     },
   };
+
+  return engine;
 }
