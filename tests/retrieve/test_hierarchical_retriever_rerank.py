@@ -260,7 +260,8 @@ def test_retriever_initializes_rerank_client(monkeypatch):
     assert retriever._rerank_client is fake_client
 
 
-def test_merge_starting_points_prefers_rerank_scores_in_thinking_mode(monkeypatch):
+@pytest.mark.asyncio
+async def test_merge_starting_points_prefers_rerank_scores_in_thinking_mode(monkeypatch):
     fake_client = FakeRerankClient([0.95, 0.05])
     monkeypatch.setattr(
         "openviking.retrieve.hierarchical_retriever.RerankClient.from_config",
@@ -273,7 +274,7 @@ def test_merge_starting_points_prefers_rerank_scores_in_thinking_mode(monkeypatc
         rerank_config=_config(),
     )
 
-    starting_points = retriever._merge_starting_points(
+    starting_points = await retriever._merge_starting_points(
         "hello",
         ["viking://resources"],
         [
