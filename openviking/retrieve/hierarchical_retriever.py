@@ -11,7 +11,10 @@ import asyncio
 import heapq
 import logging
 import math
+import os
+import threading
 import time
+import weakref
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,6 +37,26 @@ from openviking_cli.utils.config import RerankConfig, RetrievalConfig
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Process-wide rerank concurrency budget. HierarchicalRetriever is
+# constructed per search request, so the semaphore must live at module
+# scope, keyed per event loop (same pattern as the embedding semaphore in
+# models/embedder/base.py).
+RERANK_MAX_CONCURRENT = max(1, int(os.environ.get("OV_RERANK_MAX_CONCURRENT", "4")))
+_RERANK_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
+_RERANK_SEM_LOCK = threading.Lock()
+
+
+def _get_rerank_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    with _RERANK_SEM_LOCK:
+        semaphore = _RERANK_SEMAPHORES.get(loop)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(RERANK_MAX_CONCURRENT)
+            _RERANK_SEMAPHORES[loop] = semaphore
+        return semaphore
 
 
 class RetrieverMode(str):
@@ -269,12 +292,21 @@ class HierarchicalRetriever:
         documents: List[str],
         fallback_scores: List[float],
     ) -> List[float]:
-        """Return rerank scores or fall back to vector scores."""
+        """Return rerank scores or fall back to vector scores.
+
+        Caps process-wide in-flight rerank calls with a semaphore so true
+        concurrency (enabled by running rerank in a worker thread) does not
+        exceed the provider's rate limit. Scoring semantics are unchanged.
+        """
         if not self._rerank_client or not documents:
             return fallback_scores
 
         try:
-            scores = await asyncio.to_thread(self._rerank_client.rerank_batch, query, documents)
+            semaphore = _get_rerank_semaphore()
+            async with semaphore:
+                scores = await asyncio.to_thread(
+                    self._rerank_client.rerank_batch, query, documents
+                )
         except Exception as e:
             logger.warning(
                 "[HierarchicalRetriever] Rerank failed, fallback to vector scores: %s", e
