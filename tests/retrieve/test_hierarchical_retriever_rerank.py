@@ -217,6 +217,67 @@ class DirectChildProxy:
         ]
 
 
+class FanOutStorage(DummyStorage):
+    """Three directories at global search, each with one child.
+
+    Used to prove that per-directory rerank calls collapse into a single
+    call per recursion round instead of one call per directory.
+    """
+
+    DIR_URIS = (
+        "viking://resources/dir-a",
+        "viking://resources/dir-b",
+        "viking://resources/dir-c",
+    )
+
+    async def search_global_roots_in_tenant(
+        self,
+        ctx,
+        query_vector=None,
+        sparse_query_vector=None,
+        context_type=None,
+        target_directories=None,
+        extra_filter=None,
+        limit: int = 10,
+    ):
+        self.global_search_calls.append({"limit": limit})
+        return [
+            {
+                "uri": uri,
+                "abstract": f"dir {uri[-1]}",
+                "_score": score,
+                "level": 1,
+                "context_type": "resource",
+            }
+            for uri, score in zip(self.DIR_URIS, (0.3, 0.5, 0.7))
+        ]
+
+    async def search_children_in_tenant(
+        self,
+        ctx,
+        parent_uri: str,
+        query_vector=None,
+        sparse_query_vector=None,
+        context_type=None,
+        target_directories=None,
+        extra_filter=None,
+        limit: int = 10,
+    ):
+        self.child_search_calls.append({"parent_uri": parent_uri})
+        if parent_uri in self.DIR_URIS:
+            return [
+                {
+                    "uri": f"{parent_uri}/file-1",
+                    "abstract": f"file under {parent_uri[-1]}",
+                    "_score": 0.4,
+                    "level": 2,
+                    "context_type": "resource",
+                    "category": "doc",
+                }
+            ]
+        return []
+
+
 class FakeRerankClient:
     def __init__(self, scores):
         self.scores = list(scores)
@@ -260,45 +321,68 @@ def test_retriever_initializes_rerank_client(monkeypatch):
     assert retriever._rerank_client is fake_client
 
 
-@pytest.mark.asyncio
-async def test_merge_starting_points_prefers_rerank_scores_in_thinking_mode(monkeypatch):
-    fake_client = FakeRerankClient([0.95, 0.05])
-    monkeypatch.setattr(
-        "openviking.retrieve.hierarchical_retriever.RerankClient.from_config",
-        lambda config: fake_client,
-    )
-
+def test_merge_starting_points_prefers_precomputed_rerank_scores():
+    # _merge_starting_points no longer reranks by itself (commit 3 merges
+    # that call into a single retrieve()-level rerank); it now trusts
+    # whatever scores the caller already computed and passed in.
     retriever = HierarchicalRetriever(
         storage=DummyStorage(),
         embedder=DummyEmbedder(),
-        rerank_config=_config(),
+        rerank_config=None,
     )
 
-    starting_points = await retriever._merge_starting_points(
-        "hello",
+    global_results = [
+        {
+            "uri": "viking://resources/root-a",
+            "abstract": "root A",
+            "_score": 0.2,
+            "level": 1,
+        },
+        {
+            "uri": "viking://resources/root-b",
+            "abstract": "root B",
+            "_score": 0.8,
+            "level": 1,
+        },
+    ]
+    precomputed_scores = {id(global_results[0]): 0.95, id(global_results[1]): 0.05}
+
+    starting_points = retriever._merge_starting_points(
         ["viking://resources"],
-        [
-            {
-                "uri": "viking://resources/root-a",
-                "abstract": "root A",
-                "_score": 0.2,
-                "level": 1,
-            },
-            {
-                "uri": "viking://resources/root-b",
-                "abstract": "root B",
-                "_score": 0.8,
-                "level": 1,
-            },
-        ],
-        mode=RetrieverMode.THINKING,
+        global_results,
+        precomputed_scores=precomputed_scores,
     )
 
+    # Precomputed (rerank) scores win over the raw vector `_score` fields.
     assert starting_points[:2] == [
         ("viking://resources/root-a", 0.95),
         ("viking://resources/root-b", 0.05),
     ]
-    assert fake_client.calls == [("hello", ["root A", "root B"])]
+
+
+def test_merge_starting_points_falls_back_to_vector_scores_without_precomputed():
+    retriever = HierarchicalRetriever(
+        storage=DummyStorage(),
+        embedder=DummyEmbedder(),
+        rerank_config=None,
+    )
+
+    global_results = [
+        {
+            "uri": "viking://resources/root-a",
+            "abstract": "root A",
+            "_score": 0.2,
+            "level": 1,
+        },
+    ]
+
+    starting_points = retriever._merge_starting_points(
+        ["viking://resources"],
+        global_results,
+        precomputed_scores=None,
+    )
+
+    assert starting_points[0] == ("viking://resources/root-a", 0.2)
 
 
 @pytest.mark.asyncio
@@ -477,6 +561,68 @@ async def test_retrieval_hotness_alpha_blends_when_configured(monkeypatch):
     )
 
     assert result[0].score == pytest.approx(0.9)
+
+
+@pytest.mark.asyncio
+async def test_per_round_mode_merges_rerank_calls_across_directories(monkeypatch):
+    # 3 global dirs (1 rerank call) fan out to 3 directories with children
+    # in the same recursion round (1 more rerank call) = 2 calls total.
+    # Before commit 3 this would have been 1 (starting points) + 1 (per
+    # directory) * 3 = 4 calls minimum for this fixture.
+    fake_client = FakeRerankClient([0.9, 0.8, 0.7, 0.6, 0.5, 0.4])
+    monkeypatch.setattr(
+        "openviking.retrieve.hierarchical_retriever.RerankClient.from_config",
+        lambda config: fake_client,
+    )
+
+    retriever = HierarchicalRetriever(
+        storage=FanOutStorage(),
+        embedder=DummyEmbedder(),
+        rerank_config=_config(),
+    )
+
+    result = await retriever.retrieve(_query(), ctx=_ctx(), limit=3, mode=RetrieverMode.THINKING)
+
+    assert len(fake_client.calls) == 2
+    assert fake_client.calls[0][1] == ["dir a", "dir b", "dir c"]
+    assert sorted(fake_client.calls[1][1]) == sorted(
+        ["file under a", "file under b", "file under c"]
+    )
+    assert len(result.matched_contexts) == 3
+
+
+@pytest.mark.asyncio
+async def test_final_mode_skips_rerank_during_navigation_and_reranks_once(monkeypatch):
+    monkeypatch.setattr("openviking.retrieve.hierarchical_retriever.RERANK_MODE", "final")
+    # Vector scores rank file-b (0.8) above file-a (0.2); these rerank
+    # scores invert that, proving the single final call actually drives
+    # the final ranking rather than just being a no-op pass-through.
+    fake_client = FakeRerankClient([0.05, 0.95])
+    monkeypatch.setattr(
+        "openviking.retrieve.hierarchical_retriever.RerankClient.from_config",
+        lambda config: fake_client,
+    )
+
+    retriever = HierarchicalRetriever(
+        storage=DummyStorage(),
+        embedder=DummyEmbedder(),
+        rerank_config=_config(),
+    )
+
+    result = await retriever.retrieve(_query(), ctx=_ctx(), limit=2, mode=RetrieverMode.THINKING)
+
+    # Zero rerank calls during navigation (global merge + per-round merge
+    # are both skipped in final mode); exactly one call at the very end.
+    # Navigation ranked on vector scores puts file-b (0.8) ahead of file-a
+    # (0.2), so that is the pool order the final rerank call receives.
+    assert len(fake_client.calls) == 1
+    assert fake_client.calls[0][1] == ["child B", "child A"]
+    # The final rerank call (scores inverted vs. vector order) is what
+    # decides the final ranking: file-a now comes first.
+    assert [ctx.uri for ctx in result.matched_contexts] == [
+        "viking://resources/file-a",
+        "viking://resources/file-b",
+    ]
 
 
 @pytest.mark.asyncio

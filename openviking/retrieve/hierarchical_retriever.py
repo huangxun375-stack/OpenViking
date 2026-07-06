@@ -43,6 +43,13 @@ logger = get_logger(__name__)
 # scope, keyed per event loop (same pattern as the embedding semaphore in
 # models/embedder/base.py).
 RERANK_MAX_CONCURRENT = max(1, int(os.environ.get("OV_RERANK_MAX_CONCURRENT", "4")))
+# "per_round" (default): merge rerank calls (global hits once, each
+# recursion round once) while keeping every document's rerank score
+# identical to reranking it individually. "final": skip rerank while
+# navigating (rank on vector scores) and rerank once over an enlarged
+# candidate pool at the end of the retrieve. Opt-in via env; per_round
+# stays the default because it preserves per-document scores exactly.
+RERANK_MODE = os.environ.get("OV_RERANK_MODE", "per_round").strip().lower()
 _RERANK_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
     weakref.WeakKeyDictionary()
 )
@@ -198,12 +205,41 @@ class HierarchicalRetriever:
                     f"  [{i}] URI: {uri}, score: {score:.4f}, level: {result_level}, account_id: {account_id}"
                 )
 
+        # final mode navigates on vector scores alone and reranks once at the
+        # end over a wider pool; per_round (default) reranks incrementally
+        # but merges the calls that used to be issued separately.
+        final_mode = (
+            RERANK_MODE == "final"
+            and self._rerank_client is not None
+            and mode == RetrieverMode.THINKING
+        )
+        pool_limit = max(limit * 3, 24) if final_mode else limit
+
+        # Rerank every global hit in ONE call and hand the scores to both
+        # _merge_starting_points and _prepare_initial_candidates by identity,
+        # instead of each of them issuing its own rerank call. Rerank scores
+        # each (query, doc) pair independently, so batching does not change
+        # any document's score.
+        global_rerank_scores: Optional[Dict[int, float]] = None
+        if (
+            RERANK_MODE == "per_round"
+            and self._rerank_client
+            and mode == RetrieverMode.THINKING
+            and global_results
+        ):
+            docs = [str(r.get("abstract", "")) for r in global_results]
+            fallbacks = [
+                s if math.isfinite(s) else 0.0
+                for s in (r.get("_score", 0.0) for r in global_results)
+            ]
+            scores = await self._rerank_scores(query.query, docs, fallbacks)
+            global_rerank_scores = {id(r): s for r, s in zip(global_results, scores)}
+
         # Step 3: Merge starting points
-        starting_points = await self._merge_starting_points(
-            query.query,
+        starting_points = self._merge_starting_points(
             root_uris,
             global_results,
-            mode=mode,
+            precomputed_scores=global_rerank_scores,
         )
 
         # Add global hits to the result pool only when they match the requested level.
@@ -212,10 +248,9 @@ class HierarchicalRetriever:
         else:
             initial_candidates = [r for r in global_results if r.get("level", 2) == 2]
 
-        initial_candidates = await self._prepare_initial_candidates(
-            query.query,
+        initial_candidates = self._prepare_initial_candidates(
             initial_candidates,
-            mode=mode,
+            precomputed_scores=global_rerank_scores,
         )
 
         # Step 4: Recursive search
@@ -235,7 +270,24 @@ class HierarchicalRetriever:
                 scope_dsl=scope_dsl,
                 initial_candidates=initial_candidates,
                 level=level,
+                pool_limit=pool_limit,
             )
+
+        # final mode: rerank the collected pool ONCE and keep the top-limit.
+        if final_mode and candidates:
+            with telemetry.measure("search.rerank_final"):
+                docs = [str(c.get("abstract", "")) for c in candidates]
+                fallbacks = [
+                    s if math.isfinite(s) else 0.0
+                    for s in (
+                        c.get("_final_score", c.get("_score", 0.0)) for c in candidates
+                    )
+                ]
+                final_scores = await self._rerank_scores(query.query, docs, fallbacks)
+            for candidate, score in zip(candidates, final_scores, strict=True):
+                candidate["_final_score"] = score
+            candidates.sort(key=lambda x: x.get("_final_score", 0), reverse=True)
+            candidates = candidates[:limit]
 
         # Step 6: Convert results
         matched = await self._convert_to_matched_contexts(
@@ -327,40 +379,39 @@ class HierarchicalRetriever:
                 normalized_scores.append(fallback)
         return normalized_scores
 
-    async def _merge_starting_points(
+    def _merge_starting_points(
         self,
-        query: str,
         root_uris: List[str],
         global_results: List[Dict[str, Any]],
-        mode: str = "thinking",
+        precomputed_scores: Optional[Dict[int, float]] = None,
     ) -> List[Tuple[str, float]]:
         """Merge starting points.
+
+        Rerank scores, when available, are looked up from
+        ``precomputed_scores`` (keyed by ``id(result)``) rather than reranked
+        here; the caller reranks all global hits once and shares the scores
+        with this method and ``_prepare_initial_candidates``.
+
         Returns:
             List of (uri, parent_score) tuples
         """
         points = []
         seen = set()
 
-        global_results = [r for r in global_results if r.get("level", 2) != 2]
-
-        # Results from global search
-        default_scores = [
-            s if math.isfinite(s) else 0.0 for s in (r.get("_score", 0.0) for r in global_results)
-        ]
-        if self._rerank_client and mode == RetrieverMode.THINKING:
-            docs = [str(r.get("abstract", "")) for r in global_results]
-            query_scores = await self._rerank_scores(query, docs, default_scores)
-            for i, r in enumerate(global_results):
-                # 只添加非 level 2 的项目到起始点
-                if r.get("level", 2) != 2:
-                    points.append((r["uri"], query_scores[i]))
-                    seen.add(r["uri"])
-        else:
-            for r in global_results:
-                # 只添加非 level 2 的项目到起始点
-                if r.get("level", 2) != 2:
-                    points.append((r["uri"], r["_score"]))
-                    seen.add(r["uri"])
+        for r in global_results:
+            # 只添加非 level 2 的项目到起始点
+            if r.get("level", 2) == 2:
+                continue
+            fallback = r.get("_score", 0.0)
+            if not math.isfinite(fallback):
+                fallback = 0.0
+            score = (
+                precomputed_scores.get(id(r), fallback)
+                if precomputed_scores is not None
+                else fallback
+            )
+            points.append((r["uri"], score))
+            seen.add(r["uri"])
 
         # Root directories as starting points
         for uri in root_uris:
@@ -370,29 +421,30 @@ class HierarchicalRetriever:
 
         return points
 
-    async def _prepare_initial_candidates(
+    def _prepare_initial_candidates(
         self,
-        query: str,
         global_results: List[Dict[str, Any]],
-        mode: str = RetrieverMode.THINKING,
+        precomputed_scores: Optional[Dict[int, float]] = None,
     ) -> List[Dict[str, Any]]:
-        """Preserve rerank scores for global hits added to the result pool."""
-        initial_candidates = [dict(r) for r in global_results]
-        if not initial_candidates:
-            return []
+        """Preserve rerank scores for global hits added to the result pool.
 
-        default_scores = [
-            s if math.isfinite(s) else 0.0
-            for s in (r.get("_score", 0.0) for r in initial_candidates)
-        ]
-        if self._rerank_client and mode == RetrieverMode.THINKING:
-            docs = [str(r.get("abstract", "")) for r in initial_candidates]
-            query_scores = await self._rerank_scores(query, docs, default_scores)
-        else:
-            query_scores = default_scores
-
-        for candidate, score in zip(initial_candidates, query_scores, strict=True):
+        Scores are looked up from ``precomputed_scores`` (keyed by
+        ``id(result)``); see ``_merge_starting_points`` for where they come
+        from.
+        """
+        initial_candidates = []
+        for r in global_results:
+            fallback = r.get("_score", 0.0)
+            if not math.isfinite(fallback):
+                fallback = 0.0
+            score = (
+                precomputed_scores.get(id(r), fallback)
+                if precomputed_scores is not None
+                else fallback
+            )
+            candidate = dict(r)
             candidate["_score"] = score
+            initial_candidates.append(candidate)
 
         return initial_candidates
 
@@ -412,6 +464,7 @@ class HierarchicalRetriever:
         scope_dsl: Optional[Dict[str, Any]] = None,
         initial_candidates: Optional[List[Dict[str, Any]]] = None,
         level: Optional[List[int]] = None,
+        pool_limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         Recursive search with directory priority return and score propagation.
@@ -497,8 +550,35 @@ class HierarchicalRetriever:
                 *(search_children(current_uri) for current_uri, _ in batch)
             )
 
+            # Rerank every directory in this round in ONE call instead of one
+            # call per directory. Rerank scores each (query, doc) pair
+            # independently, so the merged scores are identical to reranking
+            # each directory's results on their own.
+            merged_round_scores: Optional[List[float]] = None
+            round_slices: List[Tuple[int, int]] = []
+            if (
+                RERANK_MODE == "per_round"
+                and self._rerank_client
+                and mode == RetrieverMode.THINKING
+            ):
+                round_docs: List[str] = []
+                round_fallbacks: List[float] = []
+                for results in batch_results:
+                    round_slices.append((len(round_docs), len(results)))
+                    round_docs.extend(str(r.get("abstract", "")) for r in results)
+                    round_fallbacks.extend(
+                        s if math.isfinite(s) else 0.0
+                        for s in (r.get("_score", 0.0) for r in results)
+                    )
+                if round_docs:
+                    merged_round_scores = await self._rerank_scores(
+                        query, round_docs, round_fallbacks
+                    )
+
             telemetry = get_current_telemetry()
-            for (_, current_score), results in zip(batch, batch_results, strict=True):
+            for batch_index, ((_, current_score), results) in enumerate(
+                zip(batch, batch_results, strict=True)
+            ):
                 telemetry.count("vector.searches", 1)
                 telemetry.count("vector.scored", len(results))
                 telemetry.count("vector.scanned", len(results))
@@ -506,12 +586,14 @@ class HierarchicalRetriever:
                 if not results:
                     continue
 
-                query_scores = [
-                    s if math.isfinite(s) else 0.0 for s in (r.get("_score", 0.0) for r in results)
-                ]
-                if self._rerank_client and mode == RetrieverMode.THINKING:
-                    documents = [str(r.get("abstract", "")) for r in results]
-                    query_scores = await self._rerank_scores(query, documents, query_scores)
+                if merged_round_scores is not None:
+                    start_idx, length = round_slices[batch_index]
+                    query_scores = merged_round_scores[start_idx : start_idx + length]
+                else:
+                    query_scores = [
+                        s if math.isfinite(s) else 0.0
+                        for s in (r.get("_score", 0.0) for r in results)
+                    ]
 
                 for r, score in zip(results, query_scores, strict=True):
                     uri = r.get("uri", "")
@@ -572,7 +654,7 @@ class HierarchicalRetriever:
             key=lambda x: x.get("_final_score", 0),
             reverse=True,
         )
-        return collected[:limit]
+        return collected[: (pool_limit or limit)]
 
     async def _convert_to_matched_contexts(
         self,
