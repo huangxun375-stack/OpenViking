@@ -476,9 +476,12 @@ class MarkdownParser(BaseParser):
             write_s = time.perf_counter() - write_started
 
         # Ingest local image files, placing each image next to the markdown file
-        # that references it.
+        # that references it. For generated tables with no image references, avoid
+        # glob+read over every chunk file we just wrote.
         images_started = time.perf_counter()
-        await self._ingest_local_images(layout.root_dir, base_dir, allowed_media_dirs)
+        has_image_refs = self._layout_has_local_image_refs(write_ops)
+        if has_image_refs:
+            await self._ingest_local_images(layout.root_dir, base_dir, allowed_media_dirs)
         images_s = time.perf_counter() - images_started
 
         total_s = time.perf_counter() - started
@@ -489,11 +492,37 @@ class MarkdownParser(BaseParser):
                 f"images={images_s:.3f}s ops={len(layout.ops)} mkdir_ops={len(mkdir_ops)} "
                 f"mkdir_count={mkdir_count} write_ops={len(write_ops)} "
                 f"write_chars={write_chars} concurrency={concurrency} "
-                f"rewrite_enabled={rewrite_enabled} "
+                f"rewrite_enabled={rewrite_enabled} has_image_refs={has_image_refs} "
                 f"root={layout.root_dir}"
             )
 
     # ========== Helper Methods ==========
+
+    def _layout_has_local_image_refs(self, write_ops: List[_LayoutOp]) -> bool:
+        """Return True when planned markdown content references local images.
+
+        This mirrors the image patterns consumed by _ingest_local_images, but runs
+        against in-memory layout content so pure-text imports avoid a VFS glob/read
+        pass over every generated markdown chunk.
+        """
+        try:
+            from openviking.parse.image_rewrite import HTML_IMG_PATTERN
+        except ImportError:
+            HTML_IMG_PATTERN = re.compile(
+                r"""(<img\s[^>]*?src=["'])([^"']+)(["'][^>]*>)""", re.IGNORECASE
+            )
+
+        for op in write_ops:
+            content = op.content or ""
+            if "![" in content:
+                for match in self._image_pattern.finditer(content):
+                    if not self._is_remote_uri(match.group(2)):
+                        return True
+            if "<img" in content.lower():
+                for match in HTML_IMG_PATTERN.finditer(content):
+                    if not self._is_remote_uri(match.group(2)):
+                        return True
+        return False
 
     def _extract_frontmatter(self, content: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """
