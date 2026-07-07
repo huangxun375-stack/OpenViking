@@ -618,10 +618,11 @@ async def test_final_mode_skips_rerank_during_navigation_and_reranks_once(monkey
     assert len(fake_client.calls) == 1
     assert fake_client.calls[0][1] == ["child B", "child A"]
     # The final rerank call (scores inverted vs. vector order) is what
-    # decides the final ranking: file-a now comes first.
+    # decides the final ranking: file-a (0.95) leads, and file-b (0.05)
+    # falls below the 0.1 rerank threshold and is filtered out -- the same
+    # fate it would meet under per_round navigation rerank.
     assert [ctx.uri for ctx in result.matched_contexts] == [
         "viking://resources/file-a",
-        "viking://resources/file-b",
     ]
 
 

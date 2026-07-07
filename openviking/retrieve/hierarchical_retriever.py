@@ -254,6 +254,10 @@ class HierarchicalRetriever:
         )
 
         # Step 4: Recursive search
+        # final mode: navigation scores are raw vector scores, which live on a
+        # different scale than rerank scores; the (rerank) threshold is applied
+        # after the final rerank instead of during pool collection.
+        nav_threshold = 0.0 if final_mode else effective_threshold
         with telemetry.measure("search.vector_retrieval"):
             candidates = await self._recursive_search(
                 vector_proxy=vector_proxy,
@@ -263,7 +267,7 @@ class HierarchicalRetriever:
                 starting_points=starting_points,
                 limit=limit,
                 mode=mode,
-                threshold=effective_threshold,
+                threshold=nav_threshold,
                 score_gte=score_gte,
                 context_type=query.context_type.value if query.context_type else None,
                 target_dirs=target_dirs,
@@ -286,6 +290,15 @@ class HierarchicalRetriever:
                 final_scores = await self._rerank_scores(query.query, docs, fallbacks)
             for candidate, score in zip(candidates, final_scores, strict=True):
                 candidate["_final_score"] = score
+            candidates = [
+                c
+                for c in candidates
+                if (
+                    c.get("_final_score", 0.0) >= effective_threshold
+                    if score_gte
+                    else c.get("_final_score", 0.0) > effective_threshold
+                )
+            ]
             candidates.sort(key=lambda x: x.get("_final_score", 0), reverse=True)
             candidates = candidates[:limit]
 
