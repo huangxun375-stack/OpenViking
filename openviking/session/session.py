@@ -343,6 +343,64 @@ class Usage:
     timestamp: str = field(default_factory=get_current_timestamp)
 
 
+# Per-user-space serialization of commit Phase 2 memory extraction.
+# Same-space extraction runs one at a time (decision + apply see the previous
+# run's completed state); different spaces run in parallel. An optional global
+# semaphore (memory.phase2_max_concurrent > 0) adds resource backpressure.
+# Callers key each task by space:lane (long_term / execution) so the two
+# disjoint extraction lanes may run in parallel within the same space;
+# phase2_per_space_max_concurrent is therefore per-space-per-lane.
+_phase2_space_semaphores = {}
+_phase2_space_limit = None
+_phase2_global_semaphore = None
+_phase2_global_limit = None
+
+
+def _get_phase2_space_semaphore(space_key):
+    """Return the per user space Phase 2 semaphore for space_key."""
+    global _phase2_space_semaphores, _phase2_space_limit
+    from openviking_cli.utils.config import get_openviking_config
+
+    limit = max(
+        1, int(getattr(get_openviking_config().memory, "phase2_per_space_max_concurrent", 1))
+    )
+    if _phase2_space_limit != limit:
+        _phase2_space_semaphores = {}
+        _phase2_space_limit = limit
+        logger.info("Phase2 per-space semaphore limit=%s", limit)
+    sem = _phase2_space_semaphores.get(space_key)
+    if sem is None:
+        sem = asyncio.Semaphore(limit)
+        _phase2_space_semaphores[space_key] = sem
+    return sem
+
+
+def _get_phase2_global_semaphore():
+    """Optional process-wide Phase 2 cap; returns None when disabled (default)."""
+    global _phase2_global_semaphore, _phase2_global_limit
+    from openviking_cli.utils.config import get_openviking_config
+
+    limit = int(getattr(get_openviking_config().memory, "phase2_max_concurrent", 0))
+    if limit <= 0:
+        return None
+    if _phase2_global_semaphore is None or _phase2_global_limit != limit:
+        _phase2_global_semaphore = asyncio.Semaphore(limit)
+        _phase2_global_limit = limit
+        logger.info("Phase2 global semaphore limit=%s", limit)
+    return _phase2_global_semaphore
+
+
+async def _run_memory_extraction_with_limit(space_key, coro):
+    """Serialize a Phase 2 extraction coroutine per user space (plus optional global cap)."""
+    space_sem = _get_phase2_space_semaphore(space_key)
+    global_sem = _get_phase2_global_semaphore()
+    async with space_sem:
+        if global_sem is None:
+            return await coro
+        async with global_sem:
+            return await coro
+
+
 class Session:
     """Session management class - Message = role + parts."""
 
@@ -1412,19 +1470,24 @@ class Session:
 
                         extraction_tasks: List[Any] = [_run_archive_summary()]
                         extraction_labels = ["archive_summary"]
+                        # Same-space same-lane extractions serialize; archive summary stays parallel.
+                        _phase2_space_key = f"{self.ctx.account_id}:{self.ctx.user.user_id}"
 
                         if long_term_has_work:
                             extraction_tasks.append(
-                                self._session_compressor.extract_long_term_memories(
-                                    messages=extraction_messages,
-                                    user=self.user,
-                                    session_id=self.session_id,
-                                    ctx=self.ctx,
-                                    latest_archive_overview=latest_archive_overview,
-                                    archive_uri=archive_uri,
-                                    allowed_memory_types=long_term_memory_types,
-                                    allow_self_memory=self_memory_enabled,
-                                    allowed_peer_ids=allowed_peer_ids,
+                                _run_memory_extraction_with_limit(
+                                    f"{_phase2_space_key}:long_term",
+                                    self._session_compressor.extract_long_term_memories(
+                                        messages=extraction_messages,
+                                        user=self.user,
+                                        session_id=self.session_id,
+                                        ctx=self.ctx,
+                                        latest_archive_overview=latest_archive_overview,
+                                        archive_uri=archive_uri,
+                                        allowed_memory_types=long_term_memory_types,
+                                        allow_self_memory=self_memory_enabled,
+                                        allowed_peer_ids=allowed_peer_ids,
+                                    ),
                                 )
                             )
                             extraction_labels.append("long_term")
@@ -1432,13 +1495,16 @@ class Session:
                         if has_execution_memory and execution_memory_has_work:
                             try:
                                 extraction_tasks.append(
-                                    self._session_compressor.extract_execution_memories(
-                                        messages=extraction_messages,
-                                        ctx=self.ctx,
-                                        latest_archive_overview=latest_archive_overview,
-                                        archive_uri=archive_uri,
-                                        allowed_memory_types=execution_memory_types,
-                                        include_session_skills=session_skill_extraction_enabled,
+                                    _run_memory_extraction_with_limit(
+                                        f"{_phase2_space_key}:execution",
+                                        self._session_compressor.extract_execution_memories(
+                                            messages=extraction_messages,
+                                            ctx=self.ctx,
+                                            latest_archive_overview=latest_archive_overview,
+                                            archive_uri=archive_uri,
+                                            allowed_memory_types=execution_memory_types,
+                                            include_session_skills=session_skill_extraction_enabled,
+                                        ),
                                     )
                                 )
                                 extraction_labels.append("execution")
