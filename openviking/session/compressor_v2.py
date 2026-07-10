@@ -331,6 +331,15 @@ class SessionCompressorV2:
                 context_provider=context_provider,
             )
             read_scope = isolation_handler.get_read_scope()
+            # LLM/tools run outside path_lock; the lock only covers apply writes.
+            # ExtractLoop tools are read/search only (no write side effects).
+            orchestrator._transaction_handle = transaction_handle  # 传递给 ExtractLoop
+            operations, tools_used = await orchestrator.run()
+
+            if operations is None:
+                tracer.info("No memory operations generated")
+                return []
+
             if lock_manager:
                 schemas = orchestrator.context_provider.get_memory_schemas(ctx)
                 exact_lock_paths, tree_lock_dirs = _render_memory_schema_locks(
@@ -341,7 +350,8 @@ class SessionCompressorV2:
                     isolation_handler=isolation_handler,
                 )
                 logger.debug(
-                    f"Memory schema locks: exact={exact_lock_paths}, tree={tree_lock_dirs}"
+                    f"Memory schema locks (pre-apply): exact={exact_lock_paths}, "
+                    f"tree={tree_lock_dirs}"
                 )
 
                 retry_interval = config.memory.v2_lock_retry_interval_seconds
@@ -374,18 +384,9 @@ class SessionCompressorV2:
                     if retry_interval > 0:
                         await asyncio.sleep(retry_interval)
 
-            orchestrator._transaction_handle = transaction_handle  # 传递给 ExtractLoop
-
-            # Run ReAct orchestrator
-            operations, tools_used = await orchestrator.run()
-
-            if operations is None:
-                tracer.info("No memory operations generated")
-                return []
-
             updater = self._get_or_create_updater(registry, transaction_handle)
 
-            # Apply operations with isolation_handler
+            # Apply operations with isolation_handler (under short TREE/EXACT lock)
             result = await updater.apply_operations(
                 operations,
                 ctx,
@@ -749,6 +750,15 @@ class SessionCompressorV2:
             transaction_handle = lock_manager.create_handle()
 
         try:
+            # LLM/tools run outside the lock; acquire it only right before apply.
+            provider._transaction_handle = transaction_handle
+            orchestrator._transaction_handle = transaction_handle
+            operations, _ = await orchestrator.run()
+
+            if operations is None:
+                tracer.info(f"[{phase_label}] No memory operations generated")
+                return [], [], [], {}, []
+
             if lock_manager:
                 schemas = [
                     schema
@@ -791,14 +801,6 @@ class SessionCompressorV2:
                     )
                     if retry_interval > 0:
                         await asyncio.sleep(retry_interval)
-
-            provider._transaction_handle = transaction_handle
-            orchestrator._transaction_handle = transaction_handle
-            operations, _ = await orchestrator.run()
-
-            if operations is None:
-                tracer.info(f"[{phase_label}] No memory operations generated")
-                return [], [], [], {}, []
 
             # Log raw LLM operations before applying.
             _op_items = [
