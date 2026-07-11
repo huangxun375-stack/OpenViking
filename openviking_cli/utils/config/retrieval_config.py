@@ -26,5 +26,13 @@ class RetrievalConfig(BaseModel):
             "1 uses only the child score."
         ),
     )
+    enable_intent: bool = Field(
+        default=True,
+        description=(
+            "Whether search() runs LLM intent analysis / query planning when session "
+            "context is present. false skips intent and searches with the raw query only "
+            "(same path as no-session search)."
+        ),
+    )
 
     model_config = {"extra": "forbid"}

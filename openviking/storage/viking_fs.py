@@ -1486,8 +1486,14 @@ class VikingFS:
             except Exception:
                 target_abstract = ""
 
-        # With session context: intent analysis
-        if session_summary or current_messages:
+        intent_enabled = (
+            bool(self.retrieval_config.enable_intent)
+            if self.retrieval_config is not None
+            else True
+        )
+
+        # With session context: optional intent analysis
+        if intent_enabled and (session_summary or current_messages):
             analyzer = IntentAnalyzer(max_recent_messages=5)
             with telemetry.measure("search.intent_analysis"):
                 query_plan = await analyzer.analyze(
@@ -1500,7 +1506,7 @@ class VikingFS:
             for tq in typed_queries:
                 tq.target_directories = retrieval_targets.target_directories
         else:
-            # No session context: create query directly
+            # No session context, or intent disabled: search with the raw query.
             typed_queries = [
                 TypedQuery(
                     query=query,
