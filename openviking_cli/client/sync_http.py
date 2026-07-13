@@ -148,6 +148,10 @@ class SyncHTTPClient:
             peer_id: Optional stable interaction peer identity.
 
         If both content and parts are provided, parts takes precedence.
+
+        Returns:
+            Result dict with session_id, message_count, and the persisted
+            pending_tokens value.
         """
         return run_async(
             self._async_client.add_message(
@@ -176,7 +180,8 @@ class SyncHTTPClient:
             telemetry: Whether to attach operation telemetry data to the result.
 
         Returns:
-            Result dict with session_id, message_count, and added count.
+            Result dict with session_id, message_count, added count, and the
+            persisted pending_tokens value.
         """
         return run_async(
             self._async_client.batch_add_messages(

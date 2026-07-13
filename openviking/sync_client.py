@@ -112,6 +112,10 @@ class SyncOpenViking:
             peer_id: Optional stable interaction peer identity.
 
         If both content and parts are provided, parts takes precedence.
+
+        Returns:
+            Result dict with session_id, message_count, and the persisted
+            pending_tokens value.
         """
         return run_async(
             self._async_client.add_message(
@@ -131,7 +135,7 @@ class SyncOpenViking:
         messages: list[dict],
         telemetry: TelemetryRequest = False,
     ) -> Dict[str, Any]:
-        """Add multiple messages to a session in a single request."""
+        """Add multiple messages and return counts plus persisted pending_tokens."""
         return run_async(
             self._async_client.batch_add_messages(
                 session_id,

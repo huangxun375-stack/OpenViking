@@ -503,7 +503,8 @@ class AsyncHTTPClient(BaseClient):
             telemetry: Whether to attach operation telemetry data to the result.
 
         Returns:
-            Result dict with session_id, message_count, and added count.
+            Result dict with session_id, message_count, added count, and the
+            persisted pending_tokens value.
         """
         telemetry = self._validate_telemetry(telemetry)
         payload: Dict[str, Any] = {"messages": self._batch_message_payloads(messages)}
@@ -974,6 +975,10 @@ class AsyncHTTPClient(BaseClient):
             peer_id: Optional stable interaction peer identity.
 
         If both content and parts are provided, parts takes precedence.
+
+        Returns:
+            Result dict with session_id, message_count, and the persisted
+            pending_tokens value.
         """
         telemetry = self._validate_telemetry(telemetry)
         payload: Dict[str, Any] = {"role": role}
