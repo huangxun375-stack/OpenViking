@@ -67,6 +67,8 @@ class TelemetrySummaryBuilder:
         "intent_analysis": "search.intent_analysis.duration_ms",
         "embed_query": "search.embed_query.duration_ms",
         "vector_retrieval": "search.vector_retrieval.duration_ms",
+        "rerank": "search.rerank.duration_ms",
+        "rerank_final": "search.rerank_final.duration_ms",
     }
 
     @staticmethod

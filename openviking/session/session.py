@@ -8,6 +8,7 @@ Session as Context: Sessions integrated into L0/L1/L2 system.
 import asyncio
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -1349,6 +1350,7 @@ class Session:
         lock_manager = get_lock_manager()
         redo_enabled = lock_manager.redo_recovery_enabled
         redo_log = lock_manager.redo_log
+        phase2_t0 = time.perf_counter()
 
         try:
             if not await self._wait_for_previous_archive_done(archive_index):
@@ -1667,6 +1669,23 @@ class Session:
                 },
                 account_id=self.ctx.account_id,
                 user_id=self.ctx.user.user_id,
+            )
+            logger.info(
+                "memory_extract_timing %s",
+                json.dumps(
+                    {
+                        "event": "memory_extract_timing",
+                        "session_id": self.session_id,
+                        "archive_uri": archive_uri,
+                        "duration_ms": round((time.perf_counter() - phase2_t0) * 1000, 3),
+                        "archived_messages": len(messages),
+                        "memories_extracted": memories_extracted,
+                        "session_skills_extracted": len(extracted_skill_results),
+                        "active_count_updated": active_count_updated,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
             )
             logger.info(f"Session {self.session_id} memory extraction completed")
         except asyncio.CancelledError as e:

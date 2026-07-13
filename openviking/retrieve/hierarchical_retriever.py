@@ -8,7 +8,9 @@ and rerank-based relevance scoring.
 """
 
 import asyncio
+import contextvars
 import heapq
+import json
 import logging
 import math
 import os
@@ -54,6 +56,12 @@ _RERANK_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asynci
     weakref.WeakKeyDictionary()
 )
 _RERANK_SEM_LOCK = threading.Lock()
+
+# Per-retrieve wall-clock parts (safe under concurrent retrieve on one instance).
+_RETRIEVE_TIMING: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "ov_hierarchical_retrieve_timing",
+    default=None,
+)
 
 
 def _get_rerank_semaphore() -> asyncio.Semaphore:
@@ -142,9 +150,51 @@ class HierarchicalRetriever:
         """
         t0 = time.monotonic()
         telemetry = get_current_telemetry()
+        timing: Dict[str, Any] = {
+            "embed_query_ms": 0.0,
+            "vector_retrieval_ms": 0.0,
+            "rerank_ms": 0.0,
+            "rerank_calls": 0,
+            "rerank_docs": 0,
+        }
+        timing_token = _RETRIEVE_TIMING.set(timing)
         # Use custom threshold or default threshold
         effective_threshold = score_threshold if score_threshold is not None else self.threshold
 
+        try:
+            return await self._retrieve_impl(
+                ctx=ctx,
+                query=query,
+                mode=mode,
+                limit=limit,
+                score_threshold=score_threshold,
+                score_gte=score_gte,
+                scope_dsl=scope_dsl,
+                level=level,
+                t0=t0,
+                telemetry=telemetry,
+                timing=timing,
+                effective_threshold=effective_threshold,
+            )
+        finally:
+            _RETRIEVE_TIMING.reset(timing_token)
+
+    async def _retrieve_impl(
+        self,
+        ctx: RequestContext,
+        query: TypedQuery,
+        mode: str,
+        limit: int,
+        score_threshold: Optional[float],
+        score_gte: bool,
+        scope_dsl: Optional[Dict[str, Any]],
+        level: Optional[List[int]],
+        t0: float,
+        telemetry: Any,
+        timing: Dict[str, Any],
+        effective_threshold: float,
+    ) -> QueryResult:
+        """Inner retrieve body (timing context already bound)."""
         # 创建 proxy 包装器，绑定当前 ctx
         vector_proxy = VikingDBManagerProxy(self.vector_store, ctx)
 
@@ -165,10 +215,12 @@ class HierarchicalRetriever:
         query_vector = None
         sparse_query_vector = None
         if self.embedder:
+            _te = time.perf_counter()
             with telemetry.measure("search.embed_query"):
                 result: EmbedResult = await embed_compat(self.embedder, query.query, is_query=True)
                 query_vector = result.dense_vector
                 sparse_query_vector = result.sparse_vector
+            timing["embed_query_ms"] += (time.perf_counter() - _te) * 1000
 
         # Step 1: Determine starting directories based on explicit target dirs.
         if target_dirs:
@@ -177,6 +229,7 @@ class HierarchicalRetriever:
             root_uris = default_target_directories(ctx, context_type=query.context_type)
 
         # Step 2: Global vector search to supplement starting points
+        _tv = time.perf_counter()
         with telemetry.measure("search.vector_retrieval"):
             global_results = await self._global_vector_search(
                 vector_proxy=vector_proxy,
@@ -187,6 +240,7 @@ class HierarchicalRetriever:
                 scope_dsl=scope_dsl,
                 limit=max(limit, self.GLOBAL_SEARCH_TOPK),
             )
+        timing["vector_retrieval_ms"] += (time.perf_counter() - _tv) * 1000
 
         # Debug: Print all URIs in global_results
         if logger.isEnabledFor(logging.DEBUG):
@@ -258,6 +312,7 @@ class HierarchicalRetriever:
         # different scale than rerank scores; the (rerank) threshold is applied
         # after the final rerank instead of during pool collection.
         nav_threshold = 0.0 if final_mode else effective_threshold
+        _tv = time.perf_counter()
         with telemetry.measure("search.vector_retrieval"):
             candidates = await self._recursive_search(
                 vector_proxy=vector_proxy,
@@ -276,17 +331,18 @@ class HierarchicalRetriever:
                 level=level,
                 pool_limit=pool_limit,
             )
+        timing["vector_retrieval_ms"] += (time.perf_counter() - _tv) * 1000
 
         # final mode: rerank the collected pool ONCE and keep the top-limit.
         if final_mode and candidates:
+            docs = [str(c.get("abstract", "")) for c in candidates]
+            fallbacks = [
+                s if math.isfinite(s) else 0.0
+                for s in (
+                    c.get("_final_score", c.get("_score", 0.0)) for c in candidates
+                )
+            ]
             with telemetry.measure("search.rerank_final"):
-                docs = [str(c.get("abstract", "")) for c in candidates]
-                fallbacks = [
-                    s if math.isfinite(s) else 0.0
-                    for s in (
-                        c.get("_final_score", c.get("_score", 0.0)) for c in candidates
-                    )
-                ]
                 final_scores = await self._rerank_scores(query.query, docs, fallbacks)
             for candidate, score in zip(candidates, final_scores, strict=True):
                 candidate["_final_score"] = score
@@ -312,12 +368,38 @@ class HierarchicalRetriever:
 
         # Record retrieval stats for the observer.
         elapsed_ms = (time.monotonic() - t0) * 1000
+        rerank_used = self._rerank_client is not None and mode == RetrieverMode.THINKING
         get_stats_collector().record_query(
             context_type=query.context_type.value if query.context_type else "unknown",
             result_count=len(final),
             scores=[m.score for m in final],
             latency_ms=elapsed_ms,
-            rerank_used=self._rerank_client is not None and mode == RetrieverMode.THINKING,
+            rerank_used=rerank_used,
+        )
+
+        # Always-on one-line JSON for matrix / post-hoc analysis (works even when
+        # request telemetry is disabled).
+        q = query.query or ""
+        logger.info(
+            "search_timing %s",
+            json.dumps(
+                {
+                    "event": "search_timing",
+                    "total_ms": round(elapsed_ms, 3),
+                    "embed_query_ms": round(float(timing["embed_query_ms"]), 3),
+                    "vector_retrieval_ms": round(float(timing["vector_retrieval_ms"]), 3),
+                    "rerank_ms": round(float(timing["rerank_ms"]), 3),
+                    "rerank_calls": int(timing["rerank_calls"]),
+                    "rerank_docs": int(timing["rerank_docs"]),
+                    "rerank_mode": RERANK_MODE,
+                    "rerank_used": rerank_used,
+                    "result_count": len(final),
+                    "context_type": query.context_type.value if query.context_type else None,
+                    "query_preview": q[:80],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
         )
 
         return QueryResult(
@@ -366,17 +448,28 @@ class HierarchicalRetriever:
         if not self._rerank_client or not documents:
             return fallback_scores
 
+        telemetry = get_current_telemetry()
+        t_rerank = time.perf_counter()
+        scores: Optional[List[float]] = None
         try:
-            semaphore = _get_rerank_semaphore()
-            async with semaphore:
-                scores = await asyncio.to_thread(
-                    self._rerank_client.rerank_batch, query, documents
-                )
+            with telemetry.measure("search.rerank"):
+                semaphore = _get_rerank_semaphore()
+                async with semaphore:
+                    scores = await asyncio.to_thread(
+                        self._rerank_client.rerank_batch, query, documents
+                    )
         except Exception as e:
             logger.warning(
                 "[HierarchicalRetriever] Rerank failed, fallback to vector scores: %s", e
             )
             return fallback_scores
+        finally:
+            elapsed_ms = (time.perf_counter() - t_rerank) * 1000
+            timing = _RETRIEVE_TIMING.get()
+            if timing is not None:
+                timing["rerank_ms"] = float(timing.get("rerank_ms", 0.0)) + elapsed_ms
+                timing["rerank_calls"] = int(timing.get("rerank_calls", 0)) + 1
+                timing["rerank_docs"] = int(timing.get("rerank_docs", 0)) + len(documents)
 
         if not scores or len(scores) != len(documents):
             logger.warning(
