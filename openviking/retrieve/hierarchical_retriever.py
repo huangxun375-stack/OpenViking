@@ -379,16 +379,26 @@ class HierarchicalRetriever:
 
         # Always-on one-line JSON for matrix / post-hoc analysis (works even when
         # request telemetry is disabled).
+        # model_ms = embed + rerank (provider-bound); non_model_ms = the rest
+        # (vector/local orchestration). Intent VLM, if any, is outside this retrieve.
         q = query.query or ""
+        embed_ms = round(float(timing["embed_query_ms"]), 3)
+        vector_ms = round(float(timing["vector_retrieval_ms"]), 3)
+        rerank_ms = round(float(timing["rerank_ms"]), 3)
+        total_ms = round(elapsed_ms, 3)
+        model_ms = round(embed_ms + rerank_ms, 3)
+        non_model_ms = round(max(total_ms - model_ms, 0.0), 3)
         logger.info(
             "search_timing %s",
             json.dumps(
                 {
                     "event": "search_timing",
-                    "total_ms": round(elapsed_ms, 3),
-                    "embed_query_ms": round(float(timing["embed_query_ms"]), 3),
-                    "vector_retrieval_ms": round(float(timing["vector_retrieval_ms"]), 3),
-                    "rerank_ms": round(float(timing["rerank_ms"]), 3),
+                    "total_ms": total_ms,
+                    "model_ms": model_ms,
+                    "non_model_ms": non_model_ms,
+                    "embed_query_ms": embed_ms,
+                    "vector_retrieval_ms": vector_ms,
+                    "rerank_ms": rerank_ms,
                     "rerank_calls": int(timing["rerank_calls"]),
                     "rerank_docs": int(timing["rerank_docs"]),
                     "rerank_mode": RERANK_MODE,
