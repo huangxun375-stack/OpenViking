@@ -253,8 +253,10 @@ class TestRerankConfig:
 
     def test_default_provider_is_vikingdb(self):
         config = RerankConfig()
-        assert config.provider == "vikingdb"
+        assert config._effective_provider() is None
+        config = RerankConfig(ak="ak", sk="sk")
+        assert config._effective_provider() == "vikingdb"
 
     def test_unknown_provider_raises_value_error(self):
-        with pytest.raises(ValueError, match="provider"):
-            RerankConfig(provider="cohere", ak="ak", sk="sk")
+        with pytest.raises(ValidationError, match="provider"):
+            RerankConfig(provider="not-a-real-provider", api_key="k")

@@ -219,6 +219,11 @@ class RerankClient(RerankBase):
 
             return OpenAIRerankClient.from_config(config)
 
+        if provider == "dashscope":
+            from openviking.models.rerank.dashscope_rerank import DashScopeRerankClient
+
+            return DashScopeRerankClient.from_config(config)
+
         return cls(
             ak=config.ak,
             sk=config.sk,

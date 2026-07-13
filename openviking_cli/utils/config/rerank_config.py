@@ -6,11 +6,14 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class RerankConfig(BaseModel):
-    """Configuration for rerank API. Supports VikingDB, Cohere, OpenAI-compatible, and LiteLLM providers."""
+    """Configuration for rerank API. Supports VikingDB, Cohere, OpenAI-compatible, DashScope, and LiteLLM providers."""
 
     provider: Optional[str] = Field(
         default=None,
-        description="Rerank provider: 'vikingdb', 'cohere', 'openai', or 'litellm'. Auto-detected from config if omitted.",
+        description=(
+            "Rerank provider: 'vikingdb', 'cohere', 'openai', 'dashscope', or 'litellm'. "
+            "Auto-detected from config if omitted."
+        ),
     )
 
     # VikingDB fields
@@ -57,14 +60,21 @@ class RerankConfig(BaseModel):
     @model_validator(mode="after")
     def validate_provider_fields(self) -> "RerankConfig":
         provider = self._effective_provider()
-        if provider and provider not in ["vikingdb", "cohere", "openai", "litellm"]:
-            raise ValueError(
-                f"Rerank provider must be one of ['vikingdb', 'cohere', 'openai', 'litellm'], got '{provider}'"
-            )
+        allowed = ["vikingdb", "cohere", "openai", "dashscope", "litellm"]
+        if provider and provider not in allowed:
+            raise ValueError(f"Rerank provider must be one of {allowed}, got '{provider}'")
         if provider == "openai":
             if not self.api_key or not self.api_base:
                 raise ValueError(
                     "OpenAI-compatible rerank provider requires 'api_key' and 'api_base'"
+                )
+        if provider == "dashscope":
+            if not self.api_key:
+                raise ValueError("DashScope rerank provider requires 'api_key'")
+            # Native text-rerank endpoint; openai-compatible path should use provider=openai.
+            if not self.api_base:
+                self.api_base = (
+                    "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
                 )
         if provider == "litellm":
             if not self.model:
@@ -78,6 +88,8 @@ class RerankConfig(BaseModel):
             return self.api_key is not None
         if p == "openai":
             return self.api_key is not None and self.api_base is not None
+        if p == "dashscope":
+            return self.api_key is not None
         if p == "litellm":
             return self.model is not None
         if p == "vikingdb":
