@@ -87,3 +87,55 @@ async def test_search_skips_intent_and_uses_raw_query_when_disabled(monkeypatch)
     assert captured["typed_query"].query == "raw query"
     assert captured["typed_query"].intent == ""
     assert captured["typed_query"].target_directories == ["viking://resources/docs"]
+
+
+def test_search_service_is_intent_enabled_follows_config():
+    from openviking.service.search_service import SearchService
+
+    svc = SearchService(_make_viking_fs(enable_intent=False))
+    assert svc.is_intent_enabled() is False
+
+    svc.set_viking_fs(_make_viking_fs(enable_intent=True))
+    assert svc.is_intent_enabled() is True
+
+    empty = SearchService()
+    assert empty.is_intent_enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_search_service_skips_session_context_when_intent_disabled():
+    from openviking.service.search_service import SearchService
+
+    fs = _make_viking_fs(enable_intent=False)
+    fs.search = AsyncMock(
+        return_value=MagicMock(name="find_result", query_plan=None, total=0)
+    )
+    session = MagicMock()
+    session.get_context_for_search = AsyncMock(
+        side_effect=AssertionError("must not scan session when intent disabled")
+    )
+
+    svc = SearchService(fs)
+    await svc.search(query="hello", ctx=_ctx(), session=session, target_uri="")
+
+    session.get_context_for_search.assert_not_awaited()
+    assert fs.search.await_args.kwargs.get("session_info") is None
+
+
+@pytest.mark.asyncio
+async def test_search_service_loads_session_context_when_intent_enabled():
+    from openviking.service.search_service import SearchService
+
+    fs = _make_viking_fs(enable_intent=True)
+    fs.search = AsyncMock(
+        return_value=MagicMock(name="find_result", query_plan=None, total=0)
+    )
+    session_info = {"latest_archive_overview": "ov", "current_messages": []}
+    session = MagicMock()
+    session.get_context_for_search = AsyncMock(return_value=session_info)
+
+    svc = SearchService(fs)
+    await svc.search(query="hello", ctx=_ctx(), session=session, target_uri="")
+
+    session.get_context_for_search.assert_awaited_once()
+    assert fs.search.await_args.kwargs.get("session_info") is session_info

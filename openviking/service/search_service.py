@@ -41,6 +41,17 @@ class SearchService:
             raise NotInitializedError("VikingFS")
         return self._viking_fs
 
+    def is_intent_enabled(self) -> bool:
+        """Whether search uses session context for LLM intent analysis.
+
+        When false, callers should skip session.load / get_context_for_search:
+        VikingFS.search ignores session_info and searches with the raw query.
+        Default is True (matches RetrievalConfig) when config is unset.
+        """
+        if not self._viking_fs or self._viking_fs.retrieval_config is None:
+            return True
+        return bool(self._viking_fs.retrieval_config.enable_intent)
+
     async def search(
         self,
         query: str,
@@ -71,7 +82,8 @@ class SearchService:
         viking_fs = self._ensure_initialized()
 
         session_info = None
-        if session:
+        # Intent off: session_info is unused by VikingFS — skip the archive/message scan.
+        if session is not None and self.is_intent_enabled():
             session_info = await session.get_context_for_search(query)
 
         result = await viking_fs.search(
