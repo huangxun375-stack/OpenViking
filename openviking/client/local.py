@@ -997,6 +997,7 @@ class LocalClient(BaseClient):
         return {
             "session_id": session_id,
             "message_count": len(session.messages),
+            "pending_tokens": int(session.meta.pending_tokens or 0),
         }
 
     async def batch_add_messages(
@@ -1053,6 +1054,7 @@ class LocalClient(BaseClient):
             "session_id": session_id,
             "message_count": len(session.messages),
             "added": len(added),
+            "pending_tokens": int(session.meta.pending_tokens or 0),
         }
 
     def _resolve_message_peer_id(

@@ -461,6 +461,7 @@ async def add_message(
         return {
             "session_id": session_id,
             "message_count": len(session.messages),
+            "pending_tokens": int(session.meta.pending_tokens or 0),
         }
 
     execution = await run_operation(
@@ -502,6 +503,7 @@ async def batch_add_messages(
             "session_id": session_id,
             "message_count": len(session.messages),
             "added": len(msgs),
+            "pending_tokens": int(session.meta.pending_tokens or 0),
         }
 
     execution = await run_operation(
