@@ -329,63 +329,66 @@ class SessionCompressorV2:
                 context_provider=context_provider,
             )
             read_scope = isolation_handler.get_read_scope()
-            if has_agfs:
-                schemas = orchestrator.context_provider.get_memory_schemas(ctx)
-                exact_lock_paths, tree_lock_dirs = _render_memory_schema_locks(
-                    schemas=schemas,
-                    ctx=ctx,
-                    viking_fs=viking_fs,
-                    user_ids=read_scope.user_ids,
-                    isolation_handler=isolation_handler,
-                )
-                logger.debug(
-                    f"Memory schema locks: exact={exact_lock_paths}, tree={tree_lock_dirs}"
-                )
-
-                retry_interval = config.memory.v2_lock_retry_interval_seconds
-                max_retries = config.memory.v2_lock_max_retries
-                retry_count = 0
-                last_lock_retry_warning_at = 0.0
-
-                # 循环重试获取锁（机制确保不会死锁）
-                while True:
-                    try:
-                        lease = await viking_fs._async_agfs.pathlock_acquire_exact_tree_batch(
-                            exact_lock_paths,
-                            tree_lock_dirs,
-                            timeout_secs=0.1,
-                        )
-                        break
-                    except LockAcquisitionError:
-                        retry_count += 1
-                        if max_retries > 0 and retry_count >= max_retries:
-                            raise TimeoutError(
-                                "Failed to acquire memory locks after "
-                                f"{retry_count} retries (max={max_retries})"
-                            )
-
-                        last_lock_retry_warning_at = _log_memory_lock_retry(
-                            retry_count=retry_count,
-                            max_retries=max_retries,
-                            last_warning_at=last_lock_retry_warning_at,
-                        )
-                        if retry_interval > 0:
-                            await asyncio.sleep(retry_interval)
-
-                transaction_handle = lease
-
+            # LLM/tools run outside path_lock; the lock only covers apply writes.
+            # ExtractLoop tools are read/search only (no write side effects).
             orchestrator._transaction_handle = transaction_handle  # 传递给 ExtractLoop
-
-            # Run ReAct orchestrator
             operations, tools_used = await orchestrator.run()
 
             if operations is None:
                 tracer.info("No memory operations generated")
                 result = MemoryUpdateResult()
             else:
+                if has_agfs:
+                    schemas = orchestrator.context_provider.get_memory_schemas(ctx)
+                    exact_lock_paths, tree_lock_dirs = _render_memory_schema_locks(
+                        schemas=schemas,
+                        ctx=ctx,
+                        viking_fs=viking_fs,
+                        user_ids=read_scope.user_ids,
+                        isolation_handler=isolation_handler,
+                    )
+                    logger.debug(
+                        f"Memory schema locks (pre-apply): exact={exact_lock_paths}, "
+                        f"tree={tree_lock_dirs}"
+                    )
+
+                    retry_interval = config.memory.v2_lock_retry_interval_seconds
+                    max_retries = config.memory.v2_lock_max_retries
+                    retry_count = 0
+                    last_lock_retry_warning_at = 0.0
+
+                    # 循环重试获取锁（机制确保不会死锁）
+                    while True:
+                        try:
+                            lease = (
+                                await viking_fs._async_agfs.pathlock_acquire_exact_tree_batch(
+                                    exact_lock_paths,
+                                    tree_lock_dirs,
+                                    timeout_secs=0.1,
+                                )
+                            )
+                            break
+                        except LockAcquisitionError:
+                            retry_count += 1
+                            if max_retries > 0 and retry_count >= max_retries:
+                                raise TimeoutError(
+                                    "Failed to acquire memory locks after "
+                                    f"{retry_count} retries (max={max_retries})"
+                                )
+
+                            last_lock_retry_warning_at = _log_memory_lock_retry(
+                                retry_count=retry_count,
+                                max_retries=max_retries,
+                                last_warning_at=last_lock_retry_warning_at,
+                            )
+                            if retry_interval > 0:
+                                await asyncio.sleep(retry_interval)
+
+                    transaction_handle = lease
+
                 updater = self._get_or_create_updater(registry, transaction_handle)
 
-                # Apply operations with isolation_handler
+                # Apply operations with isolation_handler (under short TREE/EXACT lock)
                 result = await updater.apply_operations(
                     operations,
                     ctx,
@@ -770,6 +773,15 @@ class SessionCompressorV2:
         has_agfs = viking_fs and hasattr(viking_fs, "agfs") and viking_fs.agfs
 
         try:
+            # LLM/tools run outside the lock; acquire it only right before apply.
+            provider._transaction_handle = transaction_handle
+            orchestrator._transaction_handle = transaction_handle
+            operations, _ = await orchestrator.run()
+
+            if operations is None:
+                tracer.info(f"[{phase_label}] No memory operations generated")
+                return [], [], [], {}, []
+
             if has_agfs:
                 schemas = [
                     schema
@@ -814,14 +826,6 @@ class SessionCompressorV2:
                             await asyncio.sleep(retry_interval)
 
                 transaction_handle = lease
-
-            provider._transaction_handle = transaction_handle
-            orchestrator._transaction_handle = transaction_handle
-            operations, _ = await orchestrator.run()
-
-            if operations is None:
-                tracer.info(f"[{phase_label}] No memory operations generated")
-                return [], [], [], {}, []
 
             # Log raw LLM operations before applying.
             _op_items = [
